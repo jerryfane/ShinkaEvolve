@@ -27,6 +27,7 @@ from typing import Optional, Dict, Any, Tuple
 
 from shinka.database import DatabaseConfig, ProgramDatabase
 from shinka.database import SystemPromptConfig, SystemPromptDatabase
+from shinka.database.eligibility import eligible_sql
 
 # We'll use a simple text-to-PDF approach instead of complex dependencies
 WEASYPRINT_AVAILABLE = False
@@ -1148,13 +1149,13 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                 # Get aggregate stats in a single query
                 # Costs are stored in metadata as: api_costs, embed_cost,
                 # novelty_cost, meta_cost
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT
                         COUNT(*) as program_count,
                         COUNT(DISTINCT generation) as generation_count,
-                        SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as correct_count,
+                        SUM(CASE WHEN {eligible_sql()} THEN 1 ELSE 0 END) as correct_count,
                         MAX(
-                            CASE WHEN correct = 1
+                            CASE WHEN {eligible_sql()}
                             THEN combined_score
                             ELSE NULL END
                         ) as best_score,
@@ -1201,10 +1202,10 @@ class DatabaseRequestHandler(http.server.SimpleHTTPRequestHandler):
                 best_gen = None
                 if row["best_score"] is not None:
                     cursor.execute(
-                        """
+                        f"""
                         SELECT MIN(generation) as best_gen
                         FROM programs
-                        WHERE correct = 1
+                        WHERE {eligible_sql()}
                           AND combined_score = ?
                     """,
                         (row["best_score"],),
