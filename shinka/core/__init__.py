@@ -1,4 +1,5 @@
 from .config import EvolutionConfig
+from .acceptance import AcceptanceGateConfig, GateVerdict, PaceGate
 from .async_runner import ShinkaEvolveRunner
 from .sampler import PromptSampler
 from .summarizer import MetaSummarizer
@@ -18,6 +19,9 @@ __all__ = [
     "AsyncNoveltyJudge",
     "ShinkaEvolveRunner",
     "EvolutionConfig",
+    "AcceptanceGateConfig",
+    "GateVerdict",
+    "PaceGate",
     "run_shinka_eval",
     "SystemPromptEvolver",
     "SystemPromptSampler",

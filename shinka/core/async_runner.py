@@ -50,6 +50,7 @@ from shinka.core.async_summarizer import AsyncMetaSummarizer
 from shinka.core.async_novelty_judge import AsyncNoveltyJudge
 from shinka.core.novelty_judge import NoveltyJudge
 from shinka.core.config import EvolutionConfig, FOLDER_PREFIX
+from shinka.core.acceptance import GateVerdict, PaceGate
 from shinka.core.pipeline_timing import (
     summarize_timing_metadata,
     with_pipeline_timing,
@@ -70,6 +71,18 @@ from shinka.utils import (
 from shinka.utils.languages import get_evolve_comment_prefix
 
 logger = logging.getLogger(__name__)
+
+# Key under ``metrics['private']`` (-> ``Program.private_metrics``) holding the
+# paired per-instance score vector the PACE acceptance gate consumes: a mapping
+# from eval instance key (e.g. the fixed ``{"seed": i + 1}`` schedule) to that
+# instance's score. Tasks publish it; the runner recovers it from the DB.
+PACE_INSTANCE_KEY = "instance_scores"
+
+# Structural verdict reason emitted when a candidate has no incumbent to beat
+# (the initial/root program): auto-pass, recorded distinctly from a missing
+# per-instance vector (``insufficient_instances``) or a real deterministic
+# auto-disable.
+PACE_REASON_NO_INCUMBENT = "no_incumbent"
 
 
 def _print_gradient_logo_and_mirror(
@@ -269,6 +282,22 @@ class ShinkaEvolveRunner:
         self.job_config = job_config
         self.db_config = db_config
         self.banner_style = banner_style
+
+        # PACE anytime-valid acceptance gate. Off by default: when the config is
+        # absent or disabled, ``self.pace_gate`` is None and every gate hook is a
+        # no-op, keeping behaviour byte-identical to stock ShinkaEvolve.
+        self.pace_gate: Optional[PaceGate] = None
+        gate_cfg = getattr(evo_config, "acceptance_gate", None)
+        if gate_cfg is not None and getattr(gate_cfg, "enabled", False):
+            self.pace_gate = PaceGate(gate_cfg)
+            logger.info(
+                "PACE acceptance gate ENABLED (alpha=%s, lam=%s, gate_bandit=%s, "
+                "gate_scratchpad=%s)",
+                gate_cfg.alpha,
+                gate_cfg.lam,
+                gate_cfg.gate_bandit,
+                gate_cfg.gate_scratchpad,
+            )
         self.enable_deadlock_debugging = debug
         log_filename = f"{self.results_dir}/evolution_run.log"
 
@@ -4327,6 +4356,157 @@ class ShinkaEvolveRunner:
             await self._release_evaluation_slot_once(job)
             await self.postprocess_slot_pool.release(postprocess_worker_id)
 
+    def _pace_gate_bandit(self) -> bool:
+        """Whether Door 3 (bandit reward) is gated (``gate_bandit`` sub-flag)."""
+        gate = getattr(self, "pace_gate", None)
+        return gate is not None and gate.config.gate_bandit
+
+    def _pace_gate_scratchpad(self) -> bool:
+        """Whether Door 4 (meta scratchpad) is gated (``gate_scratchpad``)."""
+        gate = getattr(self, "pace_gate", None)
+        return gate is not None and gate.config.gate_scratchpad
+
+    def _pace_instance_vector(self, program: Program) -> Dict[Any, float]:
+        """Recover a program's paired per-instance score vector from the DB row.
+
+        Returns an empty mapping when the task does not publish the vector; the
+        pure gate then treats the comparison as ``insufficient_instances`` and
+        passes through (never crashes an existing task).
+        """
+        private = program.private_metrics or {}
+        vector = private.get(PACE_INSTANCE_KEY)
+        if not isinstance(vector, dict):
+            return {}
+        return {
+            key: float(value)
+            for key, value in vector.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+
+    def _pace_pass_through(self, reason: str) -> GateVerdict:
+        """Build a committed pass-through verdict for a structural (non-bet) case."""
+        target = self.pace_gate.config.wealth_target
+        return GateVerdict(
+            committed=True,
+            reason=reason,
+            n_pairs=0,
+            n_discordant=0,
+            n_ties=0,
+            n_wins=0,
+            final_wealth=1.0,
+            peak_wealth=1.0,
+            wealth_target=target,
+            wealth_trajectory=[1.0],
+        )
+
+    async def _append_pace_log(
+        self, program: Program, verdict: GateVerdict
+    ) -> None:
+        """Append one human-readable verdict record to ``pace_log.jsonl``.
+
+        Serialised under a dedicated lock because side-effect workers may run
+        concurrently; the actual file write is offloaded to an executor.
+        """
+        log_lock = getattr(self, "_pace_log_lock", None)
+        if log_lock is None:
+            log_lock = asyncio.Lock()
+            self._pace_log_lock = log_lock
+
+        entry = {
+            "program_id": program.id,
+            "parent_id": program.parent_id,
+            "generation": program.generation,
+            "correct": bool(program.correct),
+            **verdict.to_dict(),
+        }
+        line = json.dumps(entry)
+        log_path = Path(self.results_dir) / "pace_log.jsonl"
+
+        def _write() -> None:
+            with open(log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+
+        async with log_lock:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _write)
+
+    async def _apply_pace_gate(
+        self, program: Program
+    ) -> Optional[GateVerdict]:
+        """Compute and record the single PACE verdict for one candidate.
+
+        Returns the :class:`GateVerdict`, or ``None`` when the gate is disabled
+        (in which case every downstream door stays byte-identical to stock). Only
+        correct candidates are judged - incorrect ones are already withheld from
+        every door by the ``correct = 0`` predicate, so the gate leaves them
+        untouched (``gate_passed`` stays 1).
+
+        On reject, the in-memory ``program.gate_passed`` is set to 0 (so the very
+        next Door 1 archive/best admission skips it) and the flag is persisted so
+        parent/inspiration/top-K selection queries exclude the candidate. The
+        verdict is written to ``program.metadata['pace']`` and appended to
+        ``pace_log.jsonl``. On resume a previously persisted verdict is reused
+        rather than re-judged.
+        """
+        gate = getattr(self, "pace_gate", None)
+        if gate is None or not program.correct:
+            return None
+
+        # Idempotence: reuse a persisted verdict on resume, never re-judge.
+        existing = (program.metadata or {}).get("pace")
+        if isinstance(existing, dict):
+            try:
+                verdict = GateVerdict.from_dict(existing)
+            except Exception:
+                verdict = None
+            if verdict is not None:
+                program.gate_passed = 1 if verdict.committed else 0
+                return verdict
+
+        parent = None
+        if program.parent_id:
+            parent = await self.async_db.get_async(program.parent_id)
+
+        if parent is None:
+            # Initial / root program: no incumbent to beat -> auto-pass.
+            verdict = self._pace_pass_through(PACE_REASON_NO_INCUMBENT)
+            logger.info(
+                "PACE gate: program %s has no parent (initial); auto-pass.",
+                program.id,
+            )
+        else:
+            candidate_vector = self._pace_instance_vector(program)
+            incumbent_vector = self._pace_instance_vector(parent)
+            verdict = gate.verdict(candidate_vector, incumbent_vector)
+
+        if program.metadata is None:
+            program.metadata = {}
+        program.metadata["pace"] = verdict.to_dict()
+        await self._append_pace_log(program, verdict)
+
+        program.gate_passed = 1 if verdict.committed else 0
+        if not verdict.committed:
+            await self.async_db.set_gate_passed_async(program.id, False)
+            logger.info(
+                "PACE gate REJECT program %s (reason=%s, wealth=%.4g/%.4g, "
+                "wins=%d/%d discordant).",
+                program.id,
+                verdict.reason,
+                verdict.final_wealth,
+                verdict.wealth_target,
+                verdict.n_wins,
+                verdict.n_discordant,
+            )
+        else:
+            logger.debug(
+                "PACE gate COMMIT program %s (reason=%s, wealth=%.4g/%.4g).",
+                program.id,
+                verdict.reason,
+                verdict.final_wealth,
+                verdict.wealth_target,
+            )
+        return verdict
+
     async def _apply_persisted_program_side_effects(
         self, persisted_event: PersistedProgramEvent
     ) -> None:
@@ -4338,6 +4518,17 @@ class ShinkaEvolveRunner:
         side_effects_completed = False
 
         try:
+            # PACE acceptance gate: compute the single verdict for this candidate
+            # BEFORE any side-effect door runs. On reject this flips the in-memory
+            # ``program.gate_passed`` to 0 (so Door 1 archive/best admission below
+            # skips it) and persists that flag (so selection queries exclude it).
+            # ``pace_committed`` is True when the gate is off or passes through, so
+            # every door below stays byte-identical to stock when disabled.
+            pace_verdict = await self._apply_pace_gate(program)
+            pace_committed = pace_verdict is None or pace_verdict.committed
+            if pace_verdict is not None:
+                metadata_persist_needed = True
+
             if hasattr(self.async_db, "run_program_maintenance_async"):
                 await self.async_db.run_program_maintenance_async(
                     program,
@@ -4379,7 +4570,12 @@ class ShinkaEvolveRunner:
                         meta_lock = asyncio.Lock()
                         self._meta_side_effect_lock = meta_lock
                     async with meta_lock:
-                        self.meta_summarizer.add_evaluated_program(program)
+                        # Door 4 (meta scratchpad): exclude gate-rejected
+                        # candidates only when the gate_scratchpad sub-flag is on;
+                        # otherwise the summariser keeps learning from every
+                        # program (stock behaviour, including failures).
+                        if pace_committed or not self._pace_gate_scratchpad():
+                            self.meta_summarizer.add_evaluated_program(program)
 
                         if self.meta_summarizer.should_update_meta(
                             self.evo_config.meta_rec_interval
@@ -4423,7 +4619,19 @@ class ShinkaEvolveRunner:
                     if program.parent_id:
                         parent = await self.async_db.get_async(program.parent_id)
                     baseline = parent.combined_score if parent else None
-                    reward = program.combined_score if program.correct else None
+                    # Door 3 (bandit): a correct-but-gate-rejected candidate feeds
+                    # a delta-0 (parent-baseline) reward when the gate_bandit
+                    # sub-flag is on, so the lucky-noise spike contributes exactly
+                    # 0 to the arm without ``None`` triggering worst-reward
+                    # imputation. Untouched legacy path otherwise.
+                    if (
+                        program.correct
+                        and not pace_committed
+                        and self._pace_gate_bandit()
+                    ):
+                        reward = baseline
+                    else:
+                        reward = program.combined_score if program.correct else None
                     model_name = program.metadata["model_name"]
                     self.llm_selection.update(
                         arm=model_name, reward=reward, baseline=baseline

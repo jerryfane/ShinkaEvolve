@@ -2258,6 +2258,15 @@ class ProgramDatabase:
             logger.debug(f"Program {program.id} not added to archive (not correct).")
             return
 
+        # Withhold PACE gate-rejected candidates from archive admission (Door 1).
+        # gate_passed defaults to 1, so this is behaviour-neutral when the gate
+        # is off; it is only 0 when an enabled gate rejected the candidate.
+        if not program.gate_passed:
+            logger.debug(
+                f"Program {program.id} not added to archive (PACE gate rejected)."
+            )
+            return
+
         self.cursor.execute("SELECT COUNT(*) FROM archive")
         count = (self.cursor.fetchone() or [0])[0]
 
@@ -2384,6 +2393,14 @@ class ProgramDatabase:
         # Only consider correct programs for best program tracking
         if not program.correct:
             logger.debug(f"Program {program.id} not considered for best (not correct).")
+            return
+
+        # Withhold PACE gate-rejected candidates from best-program tracking
+        # (Door 1). Behaviour-neutral when the gate is off (gate_passed == 1).
+        if not program.gate_passed:
+            logger.debug(
+                f"Program {program.id} not considered for best (PACE gate rejected)."
+            )
             return
 
         current_best_p = None
