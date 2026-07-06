@@ -15,11 +15,12 @@ from typing import Dict
 import pytest
 
 from shinka.core.acceptance import (
-    REASON_AUTODISABLED_DETERMINISTIC,
     REASON_COMMITTED,
     REASON_INSUFFICIENT_INSTANCES,
     REASON_REJECTED_BUDGET,
     REASON_REJECTED_EVIDENCE,
+    REASON_REJECTED_INSUFFICIENT,
+    REASON_REJECTED_NO_EVIDENCE,
     AcceptanceGateConfig,
     GateVerdict,
     PaceGate,
@@ -205,36 +206,37 @@ def test_evidence_exhaustion_rejects_without_budget_cap() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (e) Deterministic vectors auto-disable (pass-through commit).
+# (e) Zero-evidence handling (deterministic / too-few-discordant / no-common).
+#
+# Default ``zero_evidence_action="reject"``: a judged comparison that never
+# places a bet WITHHOLDS the candidate rather than silently admitting it.
 # ---------------------------------------------------------------------------
 
 
-def test_identical_vectors_autodisable() -> None:
-    cfg = AcceptanceGateConfig(enabled=True, determinism_autodisable=True)
+def test_identical_vectors_rejected_by_default() -> None:
+    cfg = AcceptanceGateConfig(enabled=True)  # zero_evidence_action="reject"
     gate = PaceGate(cfg)
     vec = {i: float(i) for i in range(10)}
     verdict = gate.verdict(dict(vec), dict(vec))
-    assert verdict.committed is True
-    assert verdict.reason == REASON_AUTODISABLED_DETERMINISTIC
+    assert verdict.committed is False
+    assert verdict.reason == REASON_REJECTED_NO_EVIDENCE
     assert verdict.n_discordant == 0
     assert verdict.n_ties == 10
 
 
-def test_low_discordant_autodisable() -> None:
-    cfg = AcceptanceGateConfig(
-        enabled=True, determinism_autodisable=True, min_discordant=5
-    )
+def test_low_discordant_rejected_by_default() -> None:
+    cfg = AcceptanceGateConfig(enabled=True, min_discordant=5)
     gate = PaceGate(cfg)
     # Only 2 discordant pairs, below min_discordant=5.
     candidate, incumbent = _binary_vectors(wins=2, losses=0, ties=20)
     verdict = gate.verdict(candidate, incumbent)
-    assert verdict.committed is True
-    assert verdict.reason == REASON_AUTODISABLED_DETERMINISTIC
+    assert verdict.committed is False
+    assert verdict.reason == REASON_REJECTED_NO_EVIDENCE
 
 
-def test_low_discordant_insufficient_when_autodisable_off() -> None:
+def test_zero_evidence_action_pass_admits() -> None:
     cfg = AcceptanceGateConfig(
-        enabled=True, determinism_autodisable=False, min_discordant=5
+        enabled=True, min_discordant=5, zero_evidence_action="pass"
     )
     gate = PaceGate(cfg)
     candidate, incumbent = _binary_vectors(wins=2, losses=0, ties=20)
@@ -243,13 +245,35 @@ def test_low_discordant_insufficient_when_autodisable_off() -> None:
     assert verdict.reason == REASON_INSUFFICIENT_INSTANCES
 
 
-def test_no_common_instances_insufficient() -> None:
-    cfg = AcceptanceGateConfig(enabled=True)
+def test_zero_evidence_action_both_modes_no_common() -> None:
+    reject = PaceGate(AcceptanceGateConfig(enabled=True))
+    v_reject = reject.verdict({1: 1.0, 2: 2.0}, {3: 1.0, 4: 2.0})
+    assert v_reject.committed is False
+    assert v_reject.reason == REASON_REJECTED_INSUFFICIENT
+    assert v_reject.n_pairs == 0
+
+    passer = PaceGate(
+        AcceptanceGateConfig(enabled=True, zero_evidence_action="pass")
+    )
+    v_pass = passer.verdict({1: 1.0, 2: 2.0}, {3: 1.0, 4: 2.0})
+    assert v_pass.committed is True
+    assert v_pass.reason == REASON_INSUFFICIENT_INSTANCES
+    assert v_pass.n_pairs == 0
+
+
+def test_determinism_autodisable_off_logs_error_for_all_ties(caplog) -> None:
+    # All-ties with determinism_autodisable=False -> logged at ERROR, still
+    # resolved by zero_evidence_action (reject by default).
+    cfg = AcceptanceGateConfig(enabled=True, determinism_autodisable=False)
     gate = PaceGate(cfg)
-    verdict = gate.verdict({1: 1.0, 2: 2.0}, {3: 1.0, 4: 2.0})
-    assert verdict.committed is True
-    assert verdict.reason == REASON_INSUFFICIENT_INSTANCES
-    assert verdict.n_pairs == 0
+    vec = {i: float(i) for i in range(6)}
+    import logging as _logging
+
+    with caplog.at_level(_logging.ERROR):
+        verdict = gate.verdict(dict(vec), dict(vec))
+    assert verdict.committed is False
+    assert verdict.reason == REASON_REJECTED_NO_EVIDENCE
+    assert any("unexpected determinism" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +324,8 @@ def test_alpha_tiny_rarely_commits() -> None:
         {"min_discordant": 0},
         {"max_pairs": 0},
         {"tie_atol": -1.0},
+        {"tie_rtol": -1.0},
+        {"zero_evidence_action": "maybe"},
     ],
 )
 def test_invalid_config_raises(kwargs: dict) -> None:
@@ -313,6 +339,9 @@ def test_config_defaults_flag_off() -> None:
     assert cfg.alpha == 0.05
     assert cfg.lam == 0.5
     assert cfg.max_pairs is None
+    assert cfg.tie_atol == pytest.approx(1e-9)
+    assert cfg.tie_rtol == pytest.approx(1e-9)
+    assert cfg.zero_evidence_action == "reject"
     assert cfg.determinism_autodisable is True
     assert cfg.gate_bandit is False
     assert cfg.gate_scratchpad is False
@@ -383,3 +412,157 @@ def test_verdict_is_idempotent() -> None:
     v1 = gate.verdict(candidate, incumbent)
     v2 = gate.verdict(candidate, incumbent)
     assert v1 == v2
+
+
+# ---------------------------------------------------------------------------
+# (h) Boolean / numeric vectors are judged (not silently inert).
+# ---------------------------------------------------------------------------
+
+
+def test_bool_vectors_are_judged() -> None:
+    cfg = AcceptanceGateConfig(enabled=True, alpha=0.05, lam=0.5)
+    gate = PaceGate(cfg)
+    # Candidate True (1.0) where incumbent False (0.0): a decisive win streak.
+    candidate = {i: True for i in range(27)}
+    incumbent = {i: False for i in range(27)}
+    verdict = gate.verdict(candidate, incumbent)
+    assert verdict.committed is True
+    assert verdict.reason == REASON_COMMITTED
+    assert verdict.n_wins == 27
+    assert verdict.n_discordant == 27
+
+
+def test_bool_and_int_ties_and_losses() -> None:
+    cfg = AcceptanceGateConfig(enabled=True, alpha=0.05, lam=0.5)
+    gate = PaceGate(cfg)
+    # Mixed bool/int: True vs 1 is a tie; False vs 1 is a loss; True vs 0 a win.
+    candidate = {0: True, 1: True, 2: False}
+    incumbent = {0: 1, 1: 0, 2: 1}
+    verdict = gate.verdict(candidate, incumbent)
+    assert verdict.n_ties == 1  # True(1.0) vs 1
+    assert verdict.n_discordant == 2
+    assert verdict.n_wins == 1  # True(1.0) vs 0
+
+
+# ---------------------------------------------------------------------------
+# (i) NaN / inf pairs are skipped (never a win, loss, or tie).
+# ---------------------------------------------------------------------------
+
+
+def test_nan_pair_skipped_and_counted() -> None:
+    cfg = AcceptanceGateConfig(enabled=True, alpha=0.05, lam=0.5)
+    gate = PaceGate(cfg)
+    candidate, incumbent = _binary_vectors(wins=5, losses=5)
+    # Poison two pairs: one with NaN on the candidate, one with inf on incumbent.
+    candidate[100], incumbent[100] = float("nan"), 0.0
+    candidate[101], incumbent[101] = 1.0, float("inf")
+    verdict = gate.verdict(candidate, incumbent)
+    assert verdict.n_invalid == 2
+    # The two poisoned pairs are neither wins, losses, nor ties.
+    assert verdict.n_pairs == 10
+    assert verdict.n_discordant == 10
+    assert verdict.n_wins == 5
+
+
+def test_nan_pair_does_not_change_wealth() -> None:
+    cfg = AcceptanceGateConfig(enabled=True, alpha=0.05, lam=0.5)
+    gate = PaceGate(cfg)
+    clean_c, clean_i = _binary_vectors(wins=5, losses=5)
+    dirty_c, dirty_i = _binary_vectors(wins=5, losses=5)
+    dirty_c[999], dirty_i[999] = float("nan"), float("nan")
+    v_clean = gate.verdict(clean_c, clean_i)
+    v_dirty = gate.verdict(dirty_c, dirty_i)
+    assert v_dirty.wealth_trajectory == pytest.approx(v_clean.wealth_trajectory)
+    assert v_dirty.n_invalid == 1
+
+
+# ---------------------------------------------------------------------------
+# (j) Relative tie tolerance (tie_rtol) classification.
+# ---------------------------------------------------------------------------
+
+
+def test_rtol_tie_classification() -> None:
+    # A difference of 1.0 between two ~1e9 values is a tie under rtol=1e-9
+    # (1.0 <= 1e-9 * 1e9 = 1.0) but NOT under atol alone.
+    cfg = AcceptanceGateConfig(
+        enabled=True, tie_atol=1e-9, tie_rtol=1e-9, min_discordant=1
+    )
+    gate = PaceGate(cfg)
+    candidate = {0: 1_000_000_000.0, 1: 2.0}
+    incumbent = {0: 999_999_999.0, 1: 0.0}
+    verdict = gate.verdict(candidate, incumbent)
+    # Instance 0 is a tie by rtol; instance 1 (2.0 vs 0.0) is a real win.
+    assert verdict.n_ties == 1
+    assert verdict.n_discordant == 1
+    assert verdict.n_wins == 1
+
+
+def test_rtol_zero_makes_large_diff_discordant() -> None:
+    cfg = AcceptanceGateConfig(
+        enabled=True, tie_atol=1e-9, tie_rtol=0.0, min_discordant=1
+    )
+    gate = PaceGate(cfg)
+    candidate = {0: 1_000_000_000.0}
+    incumbent = {0: 999_999_999.0}
+    verdict = gate.verdict(candidate, incumbent)
+    # Without rtol, the 1.0 gap far exceeds atol -> discordant win.
+    assert verdict.n_ties == 0
+    assert verdict.n_discordant == 1
+    assert verdict.n_wins == 1
+
+
+# ---------------------------------------------------------------------------
+# (k) Run-level summary counters.
+# ---------------------------------------------------------------------------
+
+
+def test_summary_counters_partition_judged() -> None:
+    cfg = AcceptanceGateConfig(enabled=True, alpha=0.05, lam=0.5)
+    gate = PaceGate(cfg)
+    # One commit, one evidence rejection, one zero-evidence (no common keys).
+    gate.verdict(*_binary_vectors(wins=27, losses=3))
+    # Alternating win/loss oscillates near 1 and never crosses the target.
+    osc_c: Dict[int, float] = {}
+    osc_i: Dict[int, float] = {}
+    for i in range(30):
+        if i % 2 == 0:
+            osc_c[i], osc_i[i] = 1.0, 0.0
+        else:
+            osc_c[i], osc_i[i] = 0.0, 1.0
+    reject = gate.verdict(osc_c, osc_i)
+    assert reject.reason == REASON_REJECTED_EVIDENCE
+    gate.verdict({1: 1.0}, {2: 1.0})
+    s = gate.summary()
+    assert s["judged"] == 3
+    assert s["committed"] == 1
+    assert s["rejected"] == 1
+    assert s["no_evidence"] == 1
+    assert s["committed"] + s["rejected"] + s["no_evidence"] == s["judged"]
+
+
+# ---------------------------------------------------------------------------
+# (l) EvolutionConfig unknown-key coercion error.
+# ---------------------------------------------------------------------------
+
+
+def test_evolution_config_unknown_gate_key_raises() -> None:
+    from shinka.core.config import EvolutionConfig
+
+    with pytest.raises(ValueError) as exc_info:
+        EvolutionConfig(
+            acceptance_gate={"enabled": True, "not_a_field": 1, "typo": 2}
+        )
+    msg = str(exc_info.value)
+    assert "acceptance_gate: unknown keys" in msg
+    assert "not_a_field" in msg and "typo" in msg
+    assert "valid keys" in msg
+
+
+def test_evolution_config_valid_gate_mapping_coerced() -> None:
+    from shinka.core.config import EvolutionConfig
+
+    cfg = EvolutionConfig(
+        acceptance_gate={"enabled": True, "zero_evidence_action": "pass"}
+    )
+    assert isinstance(cfg.acceptance_gate, AcceptanceGateConfig)
+    assert cfg.acceptance_gate.zero_evidence_action == "pass"
