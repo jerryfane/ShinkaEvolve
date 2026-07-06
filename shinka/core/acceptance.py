@@ -228,6 +228,28 @@ class PaceGate:
         self._n_rejected = 0
         self._n_no_evidence = 0
 
+    def _pass_through(self, reason: str) -> GateVerdict:
+        """Build a committed pass-through verdict for a structural (non-bet) case.
+
+        Used for comparisons the e-process never places a bet for but which must
+        be admitted unconditionally by the runner - most notably the
+        no-incumbent / initial-program case. No wealth is ever at risk, so the
+        trajectory is the bare starting ``1.0`` and the pair counts are zero.
+        """
+        target = self.config.wealth_target
+        return GateVerdict(
+            committed=True,
+            reason=reason,
+            n_pairs=0,
+            n_discordant=0,
+            n_ties=0,
+            n_wins=0,
+            final_wealth=1.0,
+            peak_wealth=1.0,
+            wealth_target=target,
+            wealth_trajectory=[1.0],
+        )
+
     def summary(self) -> Dict[str, int]:
         """Return run-level tallies accumulated across :meth:`verdict` calls.
 
