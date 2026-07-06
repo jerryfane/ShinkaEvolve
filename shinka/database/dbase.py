@@ -1164,19 +1164,45 @@ class ProgramDatabase:
         return self._program_from_row(row)
 
     @db_retry()
-    def set_gate_passed(self, program_id: str, passed: bool) -> None:
-        """Persist a PACE acceptance-gate verdict for a program.
+    def set_gate_verdict(
+        self, program_id: str, passed: bool, pace: Dict[str, Any]
+    ) -> None:
+        """Atomically persist a PACE acceptance-gate verdict for a program.
+
+        Writes the ``gate_passed`` column and merges the verdict under
+        ``metadata['pace']`` in a *single* transaction on a *single* connection,
+        so the flag and the recorded verdict can never diverge (the previous
+        split ``gate_passed`` update + deferred metadata flush could leave the
+        column and metadata inconsistent if the process died in between).
 
         Args:
             program_id: ID of the program whose verdict is being recorded.
             passed: True when the candidate is accepted (eligible for
                 selection/side-effects), False when the gate rejects it.
+            pace: The serialised :class:`~shinka.core.acceptance.GateVerdict`
+                (``verdict.to_dict()``) to merge under ``metadata['pace']``.
         """
         if not self.cursor or not self.conn:
             raise ConnectionError("DB not connected.")
         self.cursor.execute(
-            "UPDATE programs SET gate_passed = ? WHERE id = ?",
-            (1 if passed else 0, program_id),
+            "SELECT metadata FROM programs WHERE id = ?", (program_id,)
+        )
+        row = self.cursor.fetchone()
+        if row is None:
+            # Row not persisted yet (should not happen on the normal path); the
+            # in-memory verdict is still authoritative and will be flushed later.
+            return
+        metadata_text = row["metadata"]
+        try:
+            metadata = json.loads(metadata_text) if metadata_text else {}
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["pace"] = pace
+        self.cursor.execute(
+            "UPDATE programs SET gate_passed = ?, metadata = ? WHERE id = ?",
+            (1 if passed else 0, json.dumps(metadata), program_id),
         )
         self.conn.commit()
 
