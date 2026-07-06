@@ -4377,10 +4377,13 @@ class ShinkaEvolveRunner:
         vector = private.get(PACE_INSTANCE_KEY)
         if not isinstance(vector, dict):
             return {}
+        # Accept bools (True -> 1.0, False -> 0.0) and ints as numeric scores;
+        # ``bool`` is a subclass of ``int`` so ``float`` coerces it correctly.
+        # Non-numeric values (str, None, ...) are dropped.
         return {
             key: float(value)
             for key, value in vector.items()
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            if isinstance(value, (int, float))
         }
 
     def _pace_pass_through(self, reason: str) -> GateVerdict:
@@ -4504,6 +4507,21 @@ class ShinkaEvolveRunner:
                 verdict.reason,
                 verdict.final_wealth,
                 verdict.wealth_target,
+            )
+
+        # Loud inertness: whenever the gate is enabled and the verdict resolved
+        # without placing a single bet (zero-evidence pass/reject or a missing
+        # per-instance vector) - other than the structural no-incumbent case -
+        # surface it at WARNING with the program id so a silently inert gate is
+        # never mistaken for a working one.
+        placed_bet = len(verdict.wealth_trajectory) > 1
+        if not placed_bet and verdict.reason != PACE_REASON_NO_INCUMBENT:
+            logger.warning(
+                "PACE gate placed no bet for program %s (reason=%s, "
+                "committed=%s): no statistical evidence to act on.",
+                program.id,
+                verdict.reason,
+                verdict.committed,
             )
         return verdict
 

@@ -259,29 +259,59 @@ def test_true_improvement_committed_and_archived():
 
 
 # ---------------------------------------------------------------------------
-# Missing per-instance vector -> auto-pass (insufficient_instances), no crash.
+# Missing per-instance vector -> zero evidence. With the default
+# ``zero_evidence_action="reject"`` the candidate is withheld (no crash); with
+# ``"pass"`` it is admitted as ``insufficient_instances``.
 # ---------------------------------------------------------------------------
 
 
-def test_missing_instance_vector_passes_through():
+def _plain_candidate() -> Program:
+    return Program(
+        id="plain",
+        code="def f():\n    return 1\n",
+        correct=True,
+        combined_score=1.0,
+        generation=1,
+        island_idx=0,
+        parent_id="p0",
+    )
+
+
+def test_missing_instance_vector_rejected_by_default():
     with tempfile.TemporaryDirectory() as tmpdir:
         db = _make_db(tmpdir)
         async_db = AsyncProgramDatabase(db, max_workers=1)
         try:
             db.add(_instance_program("p0", _INCUMBENT, generation=0))
             # Candidate publishes no instance vector at all (legacy task).
-            cand = Program(
-                id="plain",
-                code="def f():\n    return 1\n",
-                correct=True,
-                combined_score=1.0,
-                generation=1,
-                island_idx=0,
-                parent_id="p0",
-            )
+            cand = _plain_candidate()
             db.add(cand, defer_maintenance=True)
 
             harness = _GateHarness(PaceGate(_config()), async_db, tmpdir)
+            verdict = asyncio.run(harness._apply_pace_gate(cand))
+
+            assert verdict is not None
+            assert verdict.committed is False  # zero evidence -> withheld
+            assert verdict.reason == "rejected_insufficient_instances"
+            assert cand.gate_passed == 0
+        finally:
+            db.close()
+
+
+def test_missing_instance_vector_passes_when_configured():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0))
+            cand = _plain_candidate()
+            db.add(cand, defer_maintenance=True)
+
+            harness = _GateHarness(
+                PaceGate(_config(zero_evidence_action="pass")),
+                async_db,
+                tmpdir,
+            )
             verdict = asyncio.run(harness._apply_pace_gate(cand))
 
             assert verdict is not None
