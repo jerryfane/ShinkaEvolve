@@ -150,6 +150,110 @@ def test_gate_off_is_passthrough():
             db.close()
 
 
+def _drive_scenario(tmpdir: str, *, drive_gate_off: bool) -> dict:
+    """Run a fixed multi-program scenario and snapshot the observable DB state.
+
+    The scenario plants a root incumbent, a decisive winner, and a lucky-noise
+    candidate (huge mean, loses the paired test). When ``drive_gate_off`` is
+    True each candidate is additionally routed through ``_apply_pace_gate`` with
+    ``pace_gate=None`` (the exact wiring a gate-config-absent OR ``enabled=False``
+    runner uses) before Door 1 maintenance; when False the gate methods are
+    never touched (pure stock). The two must produce byte-identical archive
+    contents, best program, top-k, and parent-sampling results.
+    """
+    import numpy as np
+
+    db = _make_db(tmpdir)
+    async_db = AsyncProgramDatabase(db, max_workers=1)
+    try:
+        harness = _GateHarness(None, async_db, tmpdir)
+        specs = [
+            ("p0", _INCUMBENT, None, 0, 0.0),
+            ("winner", _WINNER, "p0", 1, 2.0),
+            ("lucky", _LUCKY, "p0", 1, 99.0),
+        ]
+        for pid, scores, parent_id, gen, score in specs:
+            prog = _instance_program(
+                pid, scores, parent_id=parent_id, generation=gen,
+                combined_score=score,
+            )
+            db.add(prog, defer_maintenance=True)
+            if drive_gate_off:
+                assert asyncio.run(harness._apply_pace_gate(prog)) is None
+            db.run_post_add_maintenance(prog)
+
+        np.random.seed(1234)
+        selector = _selector(db)
+        sampled = [selector.sample_parent(island_idx=0).id for _ in range(50)]
+        return {
+            "archive": sorted(p.id for p in db._get_archive_programs()),
+            "best": db.get_best_program().id,
+            "top": [
+                p.id for p in db.get_top_programs(n=10, correct_only=True)
+            ],
+            "gate_flags": {
+                pid: db.get(pid).gate_passed for pid, *_ in specs
+            },
+            "sampled": sampled,
+        }
+    finally:
+        async_db.close() if hasattr(async_db, "close") else None
+        db.close()
+
+
+def test_gate_off_matches_stock_archive_best_and_selection():
+    """Finding closure: a gate-off (config-absent / ``enabled=False``) run must be
+    byte-identical to stock across every observable selection surface, not merely
+    admit one candidate to the archive. Drive the identical scenario with and
+    without the gate side-effect path and assert full equality of archive
+    contents, best program, top-k ordering, gate flags, and a deterministic
+    parent-sampling trace."""
+    with tempfile.TemporaryDirectory() as td_stock:
+        stock = _drive_scenario(td_stock, drive_gate_off=False)
+    with tempfile.TemporaryDirectory() as td_off:
+        gate_off = _drive_scenario(td_off, drive_gate_off=True)
+
+    assert gate_off == stock
+    # And the gate never left a fingerprint: all rows stay eligible, no log.
+    assert set(stock["gate_flags"].values()) == {1}
+    assert "lucky" in stock["archive"] and "winner" in stock["archive"]
+
+
+def test_runner_wiring_absent_and_disabled_both_yield_no_gate(monkeypatch, tmp_path):
+    """The runner must collapse both a *missing* ``acceptance_gate`` and an
+    explicit ``enabled=False`` config to ``pace_gate=None`` (the single source of
+    the flag-off invariance). Exercised against the real ``ShinkaEvolveRunner``
+    constructor so a future wiring change cannot silently diverge the two."""
+    from shinka.core.async_runner import ShinkaEvolveRunner
+    from shinka.core.config import EvolutionConfig
+    from shinka.launch import LocalJobConfig
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def _pace_gate_for(gate_cfg, subdir):
+        runner = ShinkaEvolveRunner(
+            evo_config=EvolutionConfig(
+                llm_models=["gpt-5-mini"],
+                llm_dynamic_selection=None,
+                meta_rec_interval=None,
+                embedding_model=None,
+                num_generations=1,
+                results_dir=str(tmp_path / subdir),
+                acceptance_gate=gate_cfg,
+            ),
+            job_config=LocalJobConfig(),
+            db_config=DatabaseConfig(db_path=str(tmp_path / subdir / "db.sqlite")),
+            verbose=False,
+            banner_style="minimal",
+        )
+        return runner.pace_gate
+
+    assert _pace_gate_for(None, "absent") is None
+    assert (
+        _pace_gate_for(AcceptanceGateConfig(enabled=False), "disabled") is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Initial (parent-less) program auto-passes.
 # ---------------------------------------------------------------------------
