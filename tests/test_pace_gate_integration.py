@@ -23,11 +23,14 @@ Coverage mirrors the design doc's integration plan:
 import asyncio
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from shinka.core import AcceptanceGateConfig, PaceGate
 from shinka.core.async_runner import (
     PACE_INSTANCE_KEY,
     PACE_REASON_NO_INCUMBENT,
+    AsyncRunningJob,
+    PersistedProgramEvent,
     ShinkaEvolveRunner,
 )
 from shinka.database import DatabaseConfig, Program, ProgramDatabase
@@ -352,6 +355,303 @@ def test_persisted_verdict_is_reused_not_rejudged():
             assert not verdict.committed
             assert verdict.reason == planted.reason
             assert cand.gate_passed == 0
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed pending row: a commit flips gate_passed 0 -> 1 atomically.
+# ---------------------------------------------------------------------------
+
+
+def test_commit_flips_pending_row_and_persists_verdict():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0))
+            # Fail-closed pending insert: judged-eligible row starts gate_passed=0
+            # and is invisible to selection until the gate commits it.
+            cand = _instance_program(
+                "winner", _WINNER, parent_id="p0", combined_score=2.0
+            )
+            cand.gate_passed = 0
+            db.add(cand, defer_maintenance=True)
+            assert db.get("winner").gate_passed == 0  # pending, invisible
+
+            harness = _GateHarness(PaceGate(_config()), async_db, tmpdir)
+            verdict = asyncio.run(harness._apply_pace_gate(cand))
+
+            assert verdict is not None and verdict.committed
+            # Atomic write flipped the column 0 -> 1 and persisted the verdict.
+            row = db.get("winner")
+            assert row.gate_passed == 1
+            assert row.metadata["pace"]["committed"] is True
+        finally:
+            db.close()
+
+
+def test_reject_persists_column_and_verdict_atomically():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0))
+            cand = _instance_program(
+                "lucky", _LUCKY, parent_id="p0", combined_score=99.0
+            )
+            cand.gate_passed = 0
+            db.add(cand, defer_maintenance=True)
+
+            harness = _GateHarness(PaceGate(_config()), async_db, tmpdir)
+            verdict = asyncio.run(harness._apply_pace_gate(cand))
+
+            assert verdict is not None and not verdict.committed
+            # A single atomic write left the column AND metadata consistent.
+            row = db.get("lucky")
+            assert row.gate_passed == 0
+            assert row.metadata["pace"]["committed"] is False
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume self-heal: a stored verdict repairs a disagreeing gate_passed column.
+# ---------------------------------------------------------------------------
+
+
+def test_resume_self_heals_disagreeing_column():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0))
+            gate = PaceGate(_config())
+            rejected = gate.verdict(_LUCKY, _INCUMBENT)
+            assert not rejected.committed
+            # Simulate a crash between the two legacy writes: metadata records a
+            # rejected verdict but the column is still the (default) eligible 1.
+            cand = _instance_program("lucky", _LUCKY, parent_id="p0")
+            cand.metadata = {"pace": rejected.to_dict()}
+            cand.gate_passed = 1  # disagrees with the stored verdict
+            db.add(cand, defer_maintenance=True)
+            assert db.get("lucky").gate_passed == 1
+
+            # Re-judging on resume honours the stored verdict AND repairs the
+            # column via the atomic write (never re-runs the e-process).
+            harness = _GateHarness(gate, async_db, tmpdir)
+            verdict = asyncio.run(harness._apply_pace_gate(cand))
+
+            assert verdict is not None and not verdict.committed
+            assert cand.gate_passed == 0
+            assert db.get("lucky").gate_passed == 0  # self-healed
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Door 3 (bandit reward): rejected candidate feeds a neutral parent-baseline
+# reward, or skips the update entirely when there is no usable baseline.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSelection:
+    """Records ``update`` calls so Door-3 reward routing can be asserted."""
+
+    def __init__(self):
+        self.updates = []
+
+    def update(self, arm, reward, baseline):
+        self.updates.append({"arm": arm, "reward": reward, "baseline": baseline})
+
+    def print_summary(self, console=None):
+        pass
+
+
+class _SideEffectHarness:
+    """Runs the real ``_apply_persisted_program_side_effects`` door pipeline."""
+
+    _pace_instance_vector = ShinkaEvolveRunner._pace_instance_vector
+    _pace_pass_through = ShinkaEvolveRunner._pace_pass_through
+    _append_pace_log = ShinkaEvolveRunner._append_pace_log
+    _apply_pace_gate = ShinkaEvolveRunner._apply_pace_gate
+    _pace_gate_bandit = ShinkaEvolveRunner._pace_gate_bandit
+    _pace_gate_scratchpad = ShinkaEvolveRunner._pace_gate_scratchpad
+    _apply_persisted_program_side_effects = (
+        ShinkaEvolveRunner._apply_persisted_program_side_effects
+    )
+    _reconstruct_persisted_event_for_resume = (
+        ShinkaEvolveRunner._reconstruct_persisted_event_for_resume
+    )
+
+    def __init__(self, pace_gate, async_db, results_dir, llm_selection):
+        self.pace_gate = pace_gate
+        self.async_db = async_db
+        self.results_dir = results_dir
+        self.llm_selection = llm_selection
+        self.verbose = False
+        self.meta_summarizer = None
+        self.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=0)
+        self.console = None
+        self.total_api_cost = 0.0
+
+    async def _update_best_solution_async(self):
+        return None
+
+    async def _persist_program_metadata_async(self, program):
+        return None
+
+
+def _side_effect_event(program: Program) -> PersistedProgramEvent:
+    job = AsyncRunningJob(
+        job_id=str(program.id),
+        exec_fname="",
+        results_dir=".",
+        start_time=0.0,
+        proposal_started_at=0.0,
+        evaluation_submitted_at=0.0,
+        generation=program.generation,
+        parent_id=program.parent_id,
+    )
+    return PersistedProgramEvent(
+        job=job,
+        program=program,
+        evaluation_finished_at=0.0,
+        postprocess_started_at=0.0,
+        postprocess_finished_at=0.0,
+    )
+
+
+def test_door3_rejected_candidate_feeds_neutral_parent_reward():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0, combined_score=5.0))
+            cand = _instance_program(
+                "lucky", _LUCKY, parent_id="p0", combined_score=99.0
+            )
+            cand.metadata = {"model_name": "arm-A"}
+            db.add(cand, defer_maintenance=True)
+
+            sel = _FakeSelection()
+            harness = _SideEffectHarness(
+                PaceGate(_config(gate_bandit=True)), async_db, tmpdir, sel
+            )
+            asyncio.run(
+                harness._apply_persisted_program_side_effects(
+                    _side_effect_event(cand)
+                )
+            )
+
+            # Rejected -> neutral reward is the incumbent's own score (delta 0),
+            # NOT the candidate's inflated 99.0.
+            assert len(sel.updates) == 1
+            assert sel.updates[0]["reward"] == 5.0
+            assert sel.updates[0]["baseline"] == 5.0
+        finally:
+            db.close()
+
+
+def test_door3_skips_update_when_parent_has_no_score():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            # Incumbent publishes an instance vector but has no combined_score.
+            db.add(
+                _instance_program(
+                    "p0", _INCUMBENT, generation=0, combined_score=None
+                )
+            )
+            cand = _instance_program(
+                "lucky", _LUCKY, parent_id="p0", combined_score=99.0
+            )
+            cand.metadata = {"model_name": "arm-A"}
+            db.add(cand, defer_maintenance=True)
+
+            sel = _FakeSelection()
+            harness = _SideEffectHarness(
+                PaceGate(_config(gate_bandit=True)), async_db, tmpdir, sel
+            )
+            asyncio.run(
+                harness._apply_persisted_program_side_effects(
+                    _side_effect_event(cand)
+                )
+            )
+
+            # No usable neutral baseline -> the update is skipped entirely rather
+            # than imputing a fabricated reward.
+            assert sel.updates == []
+        finally:
+            db.close()
+
+
+def test_door3_committed_candidate_uses_own_score():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0, combined_score=5.0))
+            cand = _instance_program(
+                "winner", _WINNER, parent_id="p0", combined_score=7.0
+            )
+            cand.metadata = {"model_name": "arm-A"}
+            db.add(cand, defer_maintenance=True)
+
+            sel = _FakeSelection()
+            harness = _SideEffectHarness(
+                PaceGate(_config(gate_bandit=True)), async_db, tmpdir, sel
+            )
+            asyncio.run(
+                harness._apply_persisted_program_side_effects(
+                    _side_effect_event(cand)
+                )
+            )
+
+            # Committed -> legacy path: the candidate's own score is the reward.
+            assert len(sel.updates) == 1
+            assert sel.updates[0]["reward"] == 7.0
+            assert sel.updates[0]["baseline"] == 5.0
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume sweep: a pending, never-judged row is judged when re-processed.
+# ---------------------------------------------------------------------------
+
+
+def test_resume_sweep_judges_pending_unprocessed_row():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(_instance_program("p0", _INCUMBENT, generation=0))
+            # A fail-closed pending row that was inserted but never judged (no
+            # metadata['pace'], gate_passed=0, missing side-effect flag) - exactly
+            # what the resume sweep must re-process.
+            cand = _instance_program(
+                "winner", _WINNER, parent_id="p0", combined_score=2.0
+            )
+            cand.gate_passed = 0
+            cand.metadata = {"source_job_id": "j0"}
+            db.add(cand, defer_maintenance=True)
+
+            sel = _FakeSelection()
+            harness = _SideEffectHarness(
+                PaceGate(_config()), async_db, tmpdir, sel
+            )
+            # Reconstruct the persisted event exactly as the resume sweep would,
+            # then run the real side-effect pipeline over it.
+            event = harness._reconstruct_persisted_event_for_resume(cand)
+            asyncio.run(harness._apply_persisted_program_side_effects(event))
+
+            # The previously-unjudged pending row is now committed: column flipped
+            # 0 -> 1 and the verdict is persisted.
+            row = db.get("winner")
+            assert row.gate_passed == 1
+            assert row.metadata["pace"]["committed"] is True
         finally:
             db.close()
 

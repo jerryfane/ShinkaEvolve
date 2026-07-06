@@ -17,6 +17,14 @@ from shinka.database.async_dbase import AsyncProgramDatabase
 from shinka.database.parents import CombinedParentSelector
 
 
+def _pace(committed: bool) -> dict:
+    """Minimal serialised gate verdict for ``set_gate_verdict`` calls."""
+    return {
+        "committed": committed,
+        "reason": "committed" if committed else "rejected_evidence",
+    }
+
+
 def _program(program_id: str, generation: int = 0, score: float = 1.0) -> Program:
     return Program(
         id=program_id,
@@ -129,35 +137,111 @@ def test_migration_is_idempotent():
 
 
 # ---------------------------------------------------------------------------
-# set_gate_passed (sync + async)
+# set_gate_verdict (sync + async): atomic column + metadata['pace'] write
 # ---------------------------------------------------------------------------
 
 
-def test_set_gate_passed_persists_both_directions():
+def test_set_gate_verdict_persists_both_directions():
     with tempfile.TemporaryDirectory() as tmpdir:
         db = _make_db(tmpdir)
         try:
             db.add(_program("p0"))
-            db.set_gate_passed("p0", False)
-            assert db.get("p0").gate_passed == 0
-            db.set_gate_passed("p0", True)
-            assert db.get("p0").gate_passed == 1
+            db.set_gate_verdict("p0", False, _pace(False))
+            got = db.get("p0")
+            assert got.gate_passed == 0
+            # The verdict is merged under metadata['pace'] in the same write.
+            assert got.metadata["pace"]["committed"] is False
+            db.set_gate_verdict("p0", True, _pace(True))
+            got = db.get("p0")
+            assert got.gate_passed == 1
+            assert got.metadata["pace"]["committed"] is True
         finally:
             db.close()
 
 
-def test_set_gate_passed_async_persists():
+def test_set_gate_verdict_preserves_existing_metadata():
+    """The atomic write must merge pace without clobbering other metadata."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        try:
+            prog = _program("p0")
+            prog.metadata = {"model_name": "gpt", "source_job_id": "j0"}
+            db.add(prog)
+            db.set_gate_verdict("p0", False, _pace(False))
+            got = db.get("p0")
+            assert got.gate_passed == 0
+            assert got.metadata["model_name"] == "gpt"
+            assert got.metadata["source_job_id"] == "j0"
+            assert got.metadata["pace"]["committed"] is False
+        finally:
+            db.close()
+
+
+def test_set_gate_verdict_async_persists():
     with tempfile.TemporaryDirectory() as tmpdir:
         sync_db = _make_db(tmpdir, name="async_gate.db")
         async_db = AsyncProgramDatabase(sync_db=sync_db)
 
         async def _run():
             await async_db.add_program_async(_program("p0"))
-            await async_db.set_gate_passed_async("p0", False)
+            await async_db.set_gate_verdict_async("p0", False, _pace(False))
 
         try:
             asyncio.run(_run())
-            assert sync_db.get("p0").gate_passed == 0
+            got = sync_db.get("p0")
+            assert got.gate_passed == 0
+            assert got.metadata["pace"]["committed"] is False
+        finally:
+            asyncio.run(async_db.close_async())
+            sync_db.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume sweep query: rows missing the postprocess_side_effects_applied flag
+# ---------------------------------------------------------------------------
+
+
+def test_get_programs_pending_side_effects_selects_only_unprocessed():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sync_db = _make_db(tmpdir, name="pending.db")
+        async_db = AsyncProgramDatabase(sync_db=sync_db)
+
+        async def _run():
+            # p_done has the applied flag set -> excluded from the sweep.
+            done = _program("p_done")
+            done.metadata = {"postprocess_side_effects_applied": True}
+            await async_db.add_program_async(done)
+            # p_pending has no flag -> included.
+            pending = _program("p_pending")
+            pending.metadata = {"source_job_id": "j1"}
+            await async_db.add_program_async(pending)
+            # p_bare has empty metadata -> also included.
+            await async_db.add_program_async(_program("p_bare"))
+            return await async_db.get_programs_pending_side_effects_async(100)
+
+        try:
+            rows = asyncio.run(_run())
+            ids = {p.id for p in rows}
+            assert "p_done" not in ids
+            assert {"p_pending", "p_bare"} <= ids
+        finally:
+            asyncio.run(async_db.close_async())
+            sync_db.close()
+
+
+def test_get_programs_pending_side_effects_respects_limit():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sync_db = _make_db(tmpdir, name="pending_limit.db")
+        async_db = AsyncProgramDatabase(sync_db=sync_db)
+
+        async def _run():
+            for i in range(5):
+                await async_db.add_program_async(_program(f"p{i}"))
+            return await async_db.get_programs_pending_side_effects_async(2)
+
+        try:
+            rows = asyncio.run(_run())
+            assert len(rows) == 2
         finally:
             asyncio.run(async_db.close_async())
             sync_db.close()
@@ -175,7 +259,7 @@ def test_get_top_programs_excludes_rejected_when_correct_only():
             db.add(_program("p0", score=1.0))
             db.add(_program("p1", score=2.0))
             db.add(_program("p2", score=3.0))
-            db.set_gate_passed("p2", False)  # reject the top scorer
+            db.set_gate_verdict("p2", False, _pace(False))  # reject the top scorer
 
             top_ids = {p.id for p in db.get_top_programs(n=10, correct_only=True)}
             assert "p2" not in top_ids
@@ -195,7 +279,7 @@ def test_get_best_program_skips_rejected_top_scorer():
             db.add(_program("p0", score=1.0))
             db.add(_program("p1", score=2.0))
             db.add(_program("p2", score=3.0))
-            db.set_gate_passed("p2", False)
+            db.set_gate_verdict("p2", False, _pace(False))
 
             best = db.get_best_program()
             assert best is not None
@@ -222,7 +306,7 @@ def test_parent_sampling_excludes_rejected():
         try:
             db.add(_program("p0", generation=0, score=1.0))
             db.add(_program("p1", generation=1, score=5.0))
-            db.set_gate_passed("p1", False)  # reject the higher-scoring child
+            db.set_gate_verdict("p1", False, _pace(False))  # reject the higher-scoring child
 
             selector = _selector(db)
             sampled = {selector.sample_parent(island_idx=0).id for _ in range(30)}
@@ -238,7 +322,7 @@ def test_has_correct_programs_ignores_rejected_only_population():
         db = _make_db(tmpdir)
         try:
             db.add(_program("p0"))
-            db.set_gate_passed("p0", False)
+            db.set_gate_verdict("p0", False, _pace(False))
             selector = _selector(db)
             assert selector.has_correct_programs(island_idx=0) is False
             # A still-eligible program flips it back to True.
