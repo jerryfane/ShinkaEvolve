@@ -588,13 +588,15 @@ class _SideEffectHarness:
         ShinkaEvolveRunner._reconstruct_persisted_event_for_resume
     )
 
-    def __init__(self, pace_gate, async_db, results_dir, llm_selection):
+    def __init__(
+        self, pace_gate, async_db, results_dir, llm_selection, meta_summarizer=None
+    ):
         self.pace_gate = pace_gate
         self.async_db = async_db
         self.results_dir = results_dir
         self.llm_selection = llm_selection
         self.verbose = False
-        self.meta_summarizer = None
+        self.meta_summarizer = meta_summarizer
         self.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=0)
         self.console = None
         self.total_api_cost = 0.0
@@ -756,6 +758,101 @@ def test_resume_sweep_judges_pending_unprocessed_row():
             row = db.get("winner")
             assert row.gate_passed == 1
             assert row.metadata["pace"]["committed"] is True
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Resume-sweep idempotence: the sweep replays only the idempotent doors and
+# never double-counts the non-idempotent bandit / meta doors.
+# ---------------------------------------------------------------------------
+
+
+class _FakeMeta:
+    """Records ``add_evaluated_program`` calls so Door-4 counting is assertable."""
+
+    def __init__(self):
+        self.added = []
+
+    def add_evaluated_program(self, program):
+        self.added.append(program.id)
+
+    def should_update_meta(self, interval):
+        return False
+
+
+def _sweep_event(program: Program) -> PersistedProgramEvent:
+    """A persisted event flagged exactly as the resume sweep produces one."""
+    event = _side_effect_event(program)
+    event.resume_sweep = True
+    return event
+
+
+def test_resume_sweep_does_not_double_count_meta_or_bandit():
+    """A crash-then-resume replays side effects, but the non-idempotent doors
+    (Door-3 bandit update, Door-4 meta ``add_evaluated_program``) must NOT fire
+    on the swept event - otherwise the program is counted twice. The hot path
+    fires them; the sweep path skips them (undercount is tolerated, double-count
+    is not). The idempotent gate verdict still runs on both."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir)
+        async_db = AsyncProgramDatabase(db, max_workers=1)
+        try:
+            db.add(
+                _instance_program(
+                    "p0", _INCUMBENT, generation=0, combined_score=5.0
+                )
+            )
+
+            def _fresh_candidate(pid: str) -> Program:
+                cand = _instance_program(
+                    pid, _WINNER, parent_id="p0", combined_score=7.0
+                )
+                cand.metadata = {"model_name": "arm-A", "source_job_id": "j0"}
+                db.add(cand, defer_maintenance=True)
+                return cand
+
+            # Hot path (resume_sweep=False): both non-idempotent doors fire once.
+            hot = _fresh_candidate("hot")
+            hot_sel, hot_meta = _FakeSelection(), _FakeMeta()
+            harness_hot = _SideEffectHarness(
+                PaceGate(_config(gate_bandit=True, gate_scratchpad=True)),
+                async_db,
+                tmpdir,
+                hot_sel,
+                hot_meta,
+            )
+            asyncio.run(
+                harness_hot._apply_persisted_program_side_effects(
+                    _side_effect_event(hot)
+                )
+            )
+            assert len(hot_sel.updates) == 1
+            assert hot_meta.added == ["hot"]
+
+            # Sweep path (resume_sweep=True): neither non-idempotent door fires,
+            # so a resumed run cannot double-count them.
+            swept = _fresh_candidate("swept")
+            swept_sel, swept_meta = _FakeSelection(), _FakeMeta()
+            harness_sweep = _SideEffectHarness(
+                PaceGate(_config(gate_bandit=True, gate_scratchpad=True)),
+                async_db,
+                tmpdir,
+                swept_sel,
+                swept_meta,
+            )
+            asyncio.run(
+                harness_sweep._apply_persisted_program_side_effects(
+                    _sweep_event(swept)
+                )
+            )
+            assert swept_sel.updates == []
+            assert swept_meta.added == []
+
+            # The idempotent gate verdict still ran on the swept row.
+            row = db.get("swept")
+            assert row.metadata["pace"]["committed"] is True
+            assert row.gate_passed == 1
         finally:
             db.close()
 

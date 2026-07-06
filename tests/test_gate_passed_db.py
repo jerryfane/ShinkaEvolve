@@ -19,6 +19,15 @@ from shinka.database.islands import CombinedIslandManager
 from shinka.database.parents import CombinedParentSelector
 
 
+# Tripwire regexes (shared by the scan tests and the semantics test below). The
+# ``(?<![\w.])`` left boundary makes them match a bare/aliased ``correct`` but
+# not a longer identifier ending in ``correct`` (``incorrect``/``is_correct``).
+_COMBINED_PREDICATE_RE = re.compile(
+    r"(?<![\w.])(?:\w+\.)?correct = 1 AND (?:\w+\.)?gate_passed = 1"
+)
+_LONE_ACCEPT_RE = re.compile(r"(?<![\w.])(?:\w+\.)?correct\s*=\s*1\b")
+
+
 def _pace(committed: bool) -> dict:
     """Minimal serialised gate verdict for ``set_gate_verdict`` calls."""
     return {
@@ -27,7 +36,12 @@ def _pace(committed: bool) -> dict:
     }
 
 
-def _program(program_id: str, generation: int = 0, score: float = 1.0) -> Program:
+def _program(
+    program_id: str,
+    generation: int = 0,
+    score: float = 1.0,
+    parent_id=None,
+) -> Program:
     return Program(
         id=program_id,
         code="def f():\n    return 1\n",
@@ -35,6 +49,7 @@ def _program(program_id: str, generation: int = 0, score: float = 1.0) -> Progra
         combined_score=score,
         generation=generation,
         island_idx=0,
+        parent_id=parent_id,
     )
 
 
@@ -209,16 +224,17 @@ def test_get_programs_pending_side_effects_selects_only_unprocessed():
         async_db = AsyncProgramDatabase(sync_db=sync_db)
 
         async def _run():
+            # Judged candidates carry a parent_id; only they are swept.
             # p_done has the applied flag set -> excluded from the sweep.
-            done = _program("p_done")
+            done = _program("p_done", parent_id="root")
             done.metadata = {"postprocess_side_effects_applied": True}
             await async_db.add_program_async(done)
             # p_pending has no flag -> included.
-            pending = _program("p_pending")
+            pending = _program("p_pending", parent_id="root")
             pending.metadata = {"source_job_id": "j1"}
             await async_db.add_program_async(pending)
             # p_bare has empty metadata -> also included.
-            await async_db.add_program_async(_program("p_bare"))
+            await async_db.add_program_async(_program("p_bare", parent_id="root"))
             return await async_db.get_programs_pending_side_effects_async(100)
 
         try:
@@ -231,6 +247,83 @@ def test_get_programs_pending_side_effects_selects_only_unprocessed():
             sync_db.close()
 
 
+def test_get_programs_pending_side_effects_excludes_parentless_rows():
+    """Only judged candidates (parent_id NOT NULL) are swept. The gen-0 initial
+    program and island copies have no parent and are pipeline-external - they
+    never pass through the proposal/evaluation side-effect path, so the sweep
+    must never re-enqueue them (doing so would re-judge / mutate rows the
+    pipeline never owned)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sync_db = _make_db(tmpdir, name="pending_parentless.db")
+        async_db = AsyncProgramDatabase(sync_db=sync_db)
+
+        async def _run():
+            # gen-0 initial program: parent_id is NULL, no applied flag.
+            await async_db.add_program_async(_program("initial", generation=0))
+            # An island copy: also parent_id NULL, pipeline-external.
+            await async_db.add_program_async(_program("island_copy"))
+            # A genuine judged candidate: parent_id set, no applied flag.
+            await async_db.add_program_async(
+                _program("candidate", generation=1, parent_id="initial")
+            )
+            return await async_db.get_programs_pending_side_effects_async(100)
+
+        try:
+            rows = asyncio.run(_run())
+            ids = {p.id for p in rows}
+            assert ids == {"candidate"}
+            assert "initial" not in ids
+            assert "island_copy" not in ids
+        finally:
+            asyncio.run(async_db.close_async())
+            sync_db.close()
+
+
+def test_set_gate_verdict_survives_concurrent_metadata_key():
+    """F5: the atomic ``json_set`` write must not clobber a metadata key written
+    by another writer just before/after the verdict. The old SELECT-merge-UPDATE
+    read a stale snapshot and could silently drop such a key; ``json_set`` on the
+    ``$.pace`` path preserves every sibling key, and the column + pace stay
+    consistent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _make_db(tmpdir, name="atomic.db")
+        try:
+            prog = _program("p0")
+            prog.metadata = {"before_key": "b"}
+            db.add(prog)
+
+            # A concurrent-ish writer touches a DIFFERENT key just before the
+            # verdict write, going straight to the column (no in-memory merge).
+            db.cursor.execute(
+                "UPDATE programs SET metadata = "
+                "json_set(COALESCE(metadata, '{}'), '$.after_key', ?) "
+                "WHERE id = ?",
+                ("a", "p0"),
+            )
+            db.conn.commit()
+
+            db.set_gate_verdict("p0", True, _pace(True))
+
+            got = db.get("p0")
+            # Both sibling keys survive the pace merge.
+            assert got.metadata["before_key"] == "b"
+            assert got.metadata["after_key"] == "a"
+            # The pace verdict is stored as a nested object (not a JSON string).
+            assert got.metadata["pace"]["committed"] is True
+            # Column and pace stay consistent in the single atomic write.
+            assert got.gate_passed == 1
+            db.cursor.execute(
+                "SELECT gate_passed, json_extract(metadata, '$.pace.committed') "
+                "FROM programs WHERE id = ?",
+                ("p0",),
+            )
+            gate_passed, pace_committed = db.cursor.fetchone()
+            assert gate_passed == 1
+            assert pace_committed == 1  # json_extract of a JSON true -> 1
+        finally:
+            db.close()
+
+
 def test_get_programs_pending_side_effects_respects_limit():
     with tempfile.TemporaryDirectory() as tmpdir:
         sync_db = _make_db(tmpdir, name="pending_limit.db")
@@ -238,7 +331,9 @@ def test_get_programs_pending_side_effects_respects_limit():
 
         async def _run():
             for i in range(5):
-                await async_db.add_program_async(_program(f"p{i}"))
+                await async_db.add_program_async(
+                    _program(f"p{i}", parent_id="root")
+                )
             return await async_db.get_programs_pending_side_effects_async(2)
 
         try:
@@ -477,8 +572,11 @@ def test_no_raw_eligibility_predicate_outside_module():
     selection site must go through ``eligible_sql()`` so a missed gate filter
     can never silently surface gate-rejected programs again."""
     shinka_root = Path(__file__).resolve().parent.parent / "shinka"
-    # Matches both the bare and table-aliased forms of the predicate.
-    predicate = re.compile(r"(?:\w+\.)?correct = 1 AND (?:\w+\.)?gate_passed = 1")
+    # Matches both the bare and table-aliased forms of the predicate. The
+    # ``(?<![\w.])`` left boundary prevents matching a longer identifier that
+    # merely ends in ``correct`` (e.g. ``incorrect``/``is_correct``); the
+    # optional ``(?:\w+\.)?`` alias group still matches ``p.correct``.
+    predicate = _COMBINED_PREDICATE_RE
 
     offenders = []
     for path in shinka_root.rglob("*.py"):
@@ -504,7 +602,11 @@ def test_no_lone_accept_side_correctness_filter():
     instead route through ``eligible_sql()``. ``correct = 0`` (the incorrect-
     program paths) is deliberately not matched."""
     shinka_root = Path(__file__).resolve().parent.parent / "shinka"
-    lone_accept = re.compile(r"(?:\w+\.)?correct\s*=\s*1\b")
+    # The ``(?<![\w.])`` left boundary ensures a bare ``correct = 1`` (or an
+    # aliased ``p.correct = 1``) is matched, but a longer identifier ending in
+    # ``correct`` - ``incorrect = 1``, ``is_correct = 1`` - is not: the char
+    # immediately before ``correct``/its alias must not be a word char or a dot.
+    lone_accept = _LONE_ACCEPT_RE
 
     offenders = []
     for path in shinka_root.rglob("*.py"):
@@ -519,3 +621,30 @@ def test_no_lone_accept_side_correctness_filter():
         "Lone accept-side 'correct = 1' filter found; use eligible_sql() so "
         "the gate_passed filter is never dropped:\n" + "\n".join(offenders)
     )
+
+
+def test_tripwire_regex_left_boundary_semantics():
+    """The tripwire left boundary must fire on real accept-side filters but not
+    on longer identifiers that merely *end* in ``correct``. Without the
+    ``(?<![\\w.])`` boundary, ``incorrect = 1`` / ``is_correct = 1`` false-match
+    the tail ``correct = 1`` and would wedge every legitimate incorrect-path
+    filter."""
+    # Positive: a bare and an aliased accept-side filter must match.
+    assert _LONE_ACCEPT_RE.search("WHERE correct = 1")
+    assert _LONE_ACCEPT_RE.search("WHERE p.correct = 1")
+    assert _COMBINED_PREDICATE_RE.search("correct = 1 AND gate_passed = 1")
+    assert _COMBINED_PREDICATE_RE.search(
+        "p.correct = 1 AND p.gate_passed = 1"
+    )
+
+    # Negative: longer identifiers ending in ``correct`` must NOT match.
+    assert not _LONE_ACCEPT_RE.search("WHERE incorrect = 1")
+    assert not _LONE_ACCEPT_RE.search("WHERE is_correct = 1")
+    assert not _COMBINED_PREDICATE_RE.search(
+        "incorrect = 1 AND gate_passed = 1"
+    )
+    assert not _COMBINED_PREDICATE_RE.search(
+        "is_correct = 1 AND gate_passed = 1"
+    )
+    # And the deliberately-excluded incorrect-path literal still does not match.
+    assert not _LONE_ACCEPT_RE.search("WHERE correct = 0")

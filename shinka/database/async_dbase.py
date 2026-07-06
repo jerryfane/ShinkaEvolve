@@ -761,6 +761,11 @@ class AsyncProgramDatabase:
         on resume; re-judging is idempotent (a persisted verdict is reused and
         the ``gate_passed`` column self-heals). Bounded by ``limit`` and ordered
         oldest-first so the sweep is deterministic and cannot blow up memory.
+
+        Only *judged candidates* (``parent_id IS NOT NULL``) are swept. The
+        gen-0 initial program and island copies have no parent and are
+        pipeline-external - they never pass through the proposal/evaluation
+        side-effect path, so they must never be re-enqueued for it.
         """
 
         def query_sync() -> List[Program]:
@@ -769,10 +774,13 @@ class AsyncProgramDatabase:
                 thread_db = ProgramDatabase(self.sync_db.config, read_only=True)
                 thread_db.cursor.execute(
                     "SELECT * FROM programs "
-                    "WHERE metadata IS NULL "
-                    "   OR json_valid(metadata) = 0 "
-                    "   OR json_extract(metadata, "
+                    "WHERE parent_id IS NOT NULL "
+                    "  AND ("
+                    "    metadata IS NULL "
+                    "    OR json_valid(metadata) = 0 "
+                    "    OR json_extract(metadata, "
                     "'$.postprocess_side_effects_applied') IS NULL "
+                    "  ) "
                     "ORDER BY timestamp ASC LIMIT ?",
                     (int(limit),),
                 )

@@ -277,6 +277,76 @@ def test_determinism_autodisable_off_logs_error_for_all_ties(caplog) -> None:
 
 
 # ---------------------------------------------------------------------------
+# (e2) Missing-vector task-shape failure (``on_missing_vectors``). Distinct from
+# the degenerate-comparison zero-evidence path: here NEITHER side publishes any
+# per-instance score, so the gate has no evidence surface at all.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_vectors_error_is_the_default() -> None:
+    # Default on_missing_vectors="error": both vectors empty -> raise loud with a
+    # remediation message rather than silently accept-all or reject-all.
+    gate = PaceGate(AcceptanceGateConfig(enabled=True))
+    with pytest.raises(RuntimeError) as excinfo:
+        gate.verdict({}, {})
+    msg = str(excinfo.value)
+    assert "instance_scores" in msg
+    assert "on_missing_vectors" in msg
+
+
+def test_missing_vectors_reject_override(caplog) -> None:
+    import logging as _logging
+
+    gate = PaceGate(
+        AcceptanceGateConfig(enabled=True, on_missing_vectors="reject")
+    )
+    with caplog.at_level(_logging.WARNING):
+        verdict = gate.verdict({}, {})
+    assert verdict.committed is False
+    assert verdict.reason == REASON_REJECTED_INSUFFICIENT
+    assert verdict.n_pairs == 0
+    assert any("missing per-instance vectors" in r.message for r in caplog.records)
+
+
+def test_missing_vectors_pass_override(caplog) -> None:
+    import logging as _logging
+
+    gate = PaceGate(
+        AcceptanceGateConfig(enabled=True, on_missing_vectors="pass")
+    )
+    with caplog.at_level(_logging.WARNING):
+        verdict = gate.verdict({}, {})
+    assert verdict.committed is True
+    assert verdict.reason == REASON_INSUFFICIENT_INSTANCES
+    assert verdict.n_pairs == 0
+    assert any("missing per-instance vectors" in r.message for r in caplog.records)
+
+
+def test_present_vectors_all_ties_still_uses_zero_evidence() -> None:
+    # Vectors PRESENT but all tied -> degenerate comparison, governed by
+    # zero_evidence_action (NOT on_missing_vectors); default rejects.
+    gate = PaceGate(
+        AcceptanceGateConfig(enabled=True, on_missing_vectors="error")
+    )
+    vec = {i: float(i) for i in range(4)}
+    verdict = gate.verdict(dict(vec), dict(vec))
+    assert verdict.committed is False
+    assert verdict.reason == REASON_REJECTED_NO_EVIDENCE
+
+
+def test_one_sided_empty_vector_is_zero_evidence_not_missing() -> None:
+    # Only one side empty (task publishes scores, this candidate has none) is a
+    # per-candidate zero-evidence case, NOT the task-shape missing-vector error.
+    gate = PaceGate(
+        AcceptanceGateConfig(enabled=True, on_missing_vectors="error")
+    )
+    verdict = gate.verdict({}, {1: 1.0, 2: 0.0})
+    assert verdict.committed is False
+    assert verdict.reason == REASON_REJECTED_INSUFFICIENT
+    assert verdict.n_pairs == 0
+
+
+# ---------------------------------------------------------------------------
 # (f) alpha / lam edge cases.
 # ---------------------------------------------------------------------------
 
@@ -326,6 +396,7 @@ def test_alpha_tiny_rarely_commits() -> None:
         {"tie_atol": -1.0},
         {"tie_rtol": -1.0},
         {"zero_evidence_action": "maybe"},
+        {"on_missing_vectors": "boom"},
     ],
 )
 def test_invalid_config_raises(kwargs: dict) -> None:
@@ -342,6 +413,7 @@ def test_config_defaults_flag_off() -> None:
     assert cfg.tie_atol == pytest.approx(1e-9)
     assert cfg.tie_rtol == pytest.approx(1e-9)
     assert cfg.zero_evidence_action == "reject"
+    assert cfg.on_missing_vectors == "error"
     assert cfg.determinism_autodisable is True
     assert cfg.gate_bandit is False
     assert cfg.gate_scratchpad is False

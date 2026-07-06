@@ -1171,10 +1171,19 @@ class ProgramDatabase:
         """Atomically persist a PACE acceptance-gate verdict for a program.
 
         Writes the ``gate_passed`` column and merges the verdict under
-        ``metadata['pace']`` in a *single* transaction on a *single* connection,
-        so the flag and the recorded verdict can never diverge (the previous
-        split ``gate_passed`` update + deferred metadata flush could leave the
-        column and metadata inconsistent if the process died in between).
+        ``metadata['pace']`` in a *single* SQL statement, so the flag and the
+        recorded verdict can never diverge (the previous split ``gate_passed``
+        update + deferred metadata flush could leave the column and metadata
+        inconsistent if the process died in between).
+
+        The merge is done with SQLite's JSON1 ``json_set`` in the ``UPDATE``
+        itself - ``metadata = json_set(COALESCE(metadata, '{}'), '$.pace',
+        json(?))`` - rather than a read-modify-write in Python. There is no
+        SELECT step, so there is no lost-update window: a concurrent writer that
+        touches a *different* metadata key before or after this call is not
+        clobbered (json_set updates only the ``$.pace`` path and preserves every
+        other key), whereas the old SELECT-merge-UPDATE could silently drop such
+        a concurrent write.
 
         Args:
             program_id: ID of the program whose verdict is being recorded.
@@ -1185,25 +1194,19 @@ class ProgramDatabase:
         """
         if not self.cursor or not self.conn:
             raise ConnectionError("DB not connected.")
+        # Single atomic statement: no read step -> no lost-update window against
+        # a concurrent writer of some other metadata key. ``json(?)`` parses the
+        # verdict JSON so it is stored as a nested object (not a quoted string),
+        # matching the shape the sweep reads via ``json_extract``. A non-existent
+        # id updates zero rows, a harmless no-op (the in-memory verdict remains
+        # authoritative and is flushed later).
         self.cursor.execute(
-            "SELECT metadata FROM programs WHERE id = ?", (program_id,)
-        )
-        row = self.cursor.fetchone()
-        if row is None:
-            # Row not persisted yet (should not happen on the normal path); the
-            # in-memory verdict is still authoritative and will be flushed later.
-            return
-        metadata_text = row["metadata"]
-        try:
-            metadata = json.loads(metadata_text) if metadata_text else {}
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata["pace"] = pace
-        self.cursor.execute(
-            "UPDATE programs SET gate_passed = ?, metadata = ? WHERE id = ?",
-            (1 if passed else 0, json.dumps(metadata), program_id),
+            "UPDATE programs "
+            "SET gate_passed = ?, "
+            "    metadata = json_set(COALESCE(metadata, '{}'), "
+            "'$.pace', json(?)) "
+            "WHERE id = ?",
+            (1 if passed else 0, json.dumps(pace), program_id),
         )
         self.conn.commit()
 

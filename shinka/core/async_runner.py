@@ -183,13 +183,24 @@ class AsyncRunningJob:
 
 @dataclass
 class PersistedProgramEvent:
-    """Durably persisted program ready for slower follow-up side effects."""
+    """Durably persisted program ready for slower follow-up side effects.
+
+    ``resume_sweep`` marks events re-enqueued by the resume side-effect sweep
+    (as opposed to the hot path for a freshly evaluated program). Swept events
+    run only the *idempotent* doors (gate verdict incl. self-heal, archive /
+    best / maintenance) and skip the *non-idempotent* ones (Door-3 bandit
+    update, Door-4 meta ``add_evaluated_program`` / meta refresh, prompt-fitness
+    updates). Tradeoff: after a crash the bandit and meta summariser may
+    *undercount* the swept program - but they can never *double-count* it, which
+    is the failure mode that actually corrupts selection.
+    """
 
     job: AsyncRunningJob
     program: Program
     evaluation_finished_at: float
     postprocess_started_at: float
     postprocess_finished_at: float
+    resume_sweep: bool = False
 
 
 @dataclass
@@ -4583,6 +4594,11 @@ class ShinkaEvolveRunner:
         apply_started_at = time.time()
         metadata_persist_needed = False
         side_effects_completed = False
+        # Resume-sweep events replay only the idempotent doors. The
+        # non-idempotent doors (prompt-fitness, Door-4 meta, Door-3 bandit) are
+        # skipped so a crash-then-resume can never double-count them; see
+        # ``PersistedProgramEvent`` for the undercount-vs-double-count tradeoff.
+        resume_sweep = persisted_event.resume_sweep
 
         try:
             # Fetch the incumbent once and thread it through both the PACE gate
@@ -4622,8 +4638,13 @@ class ShinkaEvolveRunner:
             if job.meta_patch_data:
                 system_prompt_id = job.meta_patch_data.get("system_prompt_id")
 
-            # Update prompt fitness if prompt evolution is enabled
-            if system_prompt_id and self.evo_config.evolve_prompts:
+            # Update prompt fitness if prompt evolution is enabled. Skipped on a
+            # resume sweep: prompt-fitness updates are non-idempotent.
+            if (
+                not resume_sweep
+                and system_prompt_id
+                and self.evo_config.evolve_prompts
+            ):
                 prompt_lock = getattr(self, "_prompt_side_effect_lock", None)
                 if prompt_lock is None:
                     prompt_lock = asyncio.Lock()
@@ -4646,7 +4667,10 @@ class ShinkaEvolveRunner:
                     )
                     await self._maybe_evolve_prompt()
 
-            if self.meta_summarizer:
+            # Door 4 (meta scratchpad): skipped on a resume sweep -
+            # ``add_evaluated_program`` and the meta refresh it drives are
+            # non-idempotent (they would re-count the swept program).
+            if not resume_sweep and self.meta_summarizer:
                 try:
                     meta_lock = getattr(self, "_meta_side_effect_lock", None)
                     if meta_lock is None:
@@ -4693,9 +4717,12 @@ class ShinkaEvolveRunner:
                     logger.warning(f"Meta summarizer error for {job.job_id}: {e}")
                     # Don't fail the whole job for meta summarizer issues
 
-            # Update LLM selection
-            if self.llm_selection is not None and "model_name" in (
-                program.metadata or {}
+            # Update LLM selection (Door 3 bandit). Skipped on a resume sweep:
+            # the bandit update is non-idempotent and must never re-count.
+            if (
+                not resume_sweep
+                and self.llm_selection is not None
+                and "model_name" in (program.metadata or {})
             ):
                 try:
                     # Reuse the parent already fetched for the gate (no second
@@ -4876,6 +4903,7 @@ class ShinkaEvolveRunner:
             evaluation_finished_at=eval_finished,
             postprocess_started_at=post_started,
             postprocess_finished_at=post_finished,
+            resume_sweep=True,
         )
 
     async def _resume_pace_side_effect_sweep(self) -> None:

@@ -55,6 +55,11 @@ VERDICT_REASONS = (
 # Allowed values for ``AcceptanceGateConfig.zero_evidence_action``.
 ZERO_EVIDENCE_ACTIONS = ("reject", "pass")
 
+# Allowed values for ``AcceptanceGateConfig.on_missing_vectors``. Governs the
+# task-shape failure where a judged comparison has *no* per-instance score
+# vectors on either side (the task publishes no per-instance scores at all).
+ON_MISSING_VECTORS_ACTIONS = ("error", "reject", "pass")
+
 
 @dataclass
 class AcceptanceGateConfig:
@@ -84,11 +89,33 @@ class AcceptanceGateConfig:
         tie_rtol: Relative tie tolerance, scaled by the larger of the two
             per-instance magnitudes (see ``tie_atol``). Must be ``>= 0``.
         zero_evidence_action: What to do when a judged comparison ends without
-            any bet placed - no common instances (``n_pairs == 0``) or fewer
-            than ``min_discordant`` discordant pairs. ``"reject"`` (default)
+            any bet placed *despite both sides publishing per-instance vectors* -
+            no common instances (``n_pairs == 0``), all valid pairs tied, or
+            fewer than ``min_discordant`` discordant pairs. ``"reject"`` (default)
             withholds the candidate (``committed=False``); ``"pass"`` admits it
             (``committed=True``). Either way a warning is logged - a zero-evidence
-            resolution is never silent.
+            resolution is never silent. This governs the *degenerate comparison*
+            case; the distinct *missing-vector* (task-shape failure) case is
+            governed by ``on_missing_vectors``.
+        on_missing_vectors: What to do when a judged comparison has *no*
+            per-instance score vectors on *either* side (candidate and incumbent
+            are both empty), i.e. the task publishes no per-instance scores at
+            all. This is a task-shape failure, not a degenerate comparison, so it
+            is handled separately from ``zero_evidence_action``:
+
+            * ``"error"`` (default) raises :class:`RuntimeError` at the first
+              occurrence with a remediation message - an enabled gate must never
+              be silently inert (accepting everything) nor silently starve
+              evolution (rejecting everything) because the wiring is wrong; it
+              fails loud so the misconfiguration is caught immediately.
+            * ``"reject"`` withholds the candidate (``committed=False``) with a
+              ``logger.warning``.
+            * ``"pass"`` admits the candidate (``committed=True``) with a
+              ``logger.warning``.
+
+            The degenerate-comparison semantics (all-ties / low-discordant with
+            vectors *present*) are unaffected by this flag and keep their
+            ``zero_evidence_action`` resolution.
         determinism_autodisable: Back-compat flag that now only controls the log
             severity of the all-ties case (every valid pair is a tie, i.e. the
             fitness looks deterministic). When ``True`` (default) the all-ties
@@ -111,6 +138,7 @@ class AcceptanceGateConfig:
     tie_atol: float = 1e-9
     tie_rtol: float = 1e-9
     zero_evidence_action: str = "reject"
+    on_missing_vectors: str = "error"
     determinism_autodisable: bool = True
     gate_bandit: bool = False
     gate_scratchpad: bool = False
@@ -137,6 +165,12 @@ class AcceptanceGateConfig:
                 "zero_evidence_action must be one of "
                 f"{list(ZERO_EVIDENCE_ACTIONS)}, got "
                 f"{self.zero_evidence_action!r}"
+            )
+        if self.on_missing_vectors not in ON_MISSING_VECTORS_ACTIONS:
+            raise ValueError(
+                "on_missing_vectors must be one of "
+                f"{list(ON_MISSING_VECTORS_ACTIONS)}, got "
+                f"{self.on_missing_vectors!r}"
             )
 
     @property
@@ -286,6 +320,18 @@ class PaceGate:
         """
         cfg = self.config
         self._n_judged += 1
+
+        # Task-shape failure vs. degenerate comparison: if *neither* side
+        # publishes any per-instance score the task itself has no evidence
+        # surface, which is a wiring/config error rather than a legitimately
+        # inconclusive comparison. Resolve it via ``on_missing_vectors`` so an
+        # enabled gate is never silently inert (accept-all) nor silently starves
+        # evolution (reject-all). A comparison with vectors *present* that merely
+        # produces no bets (all-ties / low-discordant) is handled below by
+        # ``zero_evidence_action`` and keeps those semantics unchanged.
+        if not candidate_vector and not incumbent_vector:
+            return self._missing_vectors_verdict()
+
         common = sorted(set(candidate_vector) & set(incumbent_vector))
 
         # Classify every common pair into invalid (NaN/inf on either side),
@@ -387,6 +433,64 @@ class PaceGate:
             peak_wealth=peak,
             wealth_target=target,
             wealth_trajectory=trajectory,
+        )
+
+    def _missing_vectors_verdict(self) -> GateVerdict:
+        """Resolve a judged comparison with no per-instance vectors on either side.
+
+        This is the task-shape failure: the task publishes no per-instance scores
+        at all, so the gate has nothing to bet on. Governed by
+        ``config.on_missing_vectors``:
+
+        * ``"error"`` -> raise :class:`RuntimeError` with a remediation message
+          (the gate fails loud rather than becoming silently inert or silently
+          starving evolution).
+        * ``"reject"`` -> withhold (``committed=False``) with a warning.
+        * ``"pass"`` -> admit (``committed=True``) with a warning.
+        """
+        cfg = self.config
+        action = cfg.on_missing_vectors
+
+        if action == "error":
+            raise RuntimeError(
+                "PACE gate: judged comparison has no per-instance score vectors "
+                "on either side (candidate and incumbent are both empty), so an "
+                "enabled gate can neither accept nor reject on evidence. This is "
+                "a task-shape failure: the task publishes no per-instance "
+                "scores. Remediation: publish "
+                "metrics['private']['instance_scores'] (a mapping from instance "
+                "key to per-instance score) from your evaluation, or set "
+                "AcceptanceGateConfig.on_missing_vectors explicitly to 'reject' "
+                "or 'pass' to opt into the degenerate accept-all/reject-all "
+                "behaviour deliberately."
+            )
+
+        self._n_no_evidence += 1
+        committed = action == "pass"
+        reason = (
+            REASON_INSUFFICIENT_INSTANCES
+            if committed
+            else REASON_REJECTED_INSUFFICIENT
+        )
+        logger.warning(
+            "PACE gate: missing per-instance vectors (both candidate and "
+            "incumbent empty; task publishes no per-instance scores); "
+            "on_missing_vectors=%s -> %s.",
+            action,
+            "commit" if committed else "reject",
+        )
+        return GateVerdict(
+            committed=committed,
+            reason=reason,
+            n_pairs=0,
+            n_discordant=0,
+            n_ties=0,
+            n_wins=0,
+            n_invalid=0,
+            final_wealth=1.0,
+            peak_wealth=1.0,
+            wealth_target=cfg.wealth_target,
+            wealth_trajectory=[1.0],
         )
 
     def _zero_evidence_verdict(
