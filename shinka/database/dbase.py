@@ -9,6 +9,7 @@ import numpy as np
 from typing import Any, Dict, List, Optional, Tuple, Union
 import math
 from .complexity import analyze_code_metrics
+from .eligibility import eligible_sql
 from .parents import CombinedParentSelector
 from .inspirations import CombinedContextSelector
 from .islands import CombinedIslandManager
@@ -173,6 +174,10 @@ class Program:
     private_metrics: Dict[str, Any] = field(default_factory=dict)
     text_feedback: Union[str, List[str]] = ""
     correct: bool = False  # Whether the program is functionally correct
+    # PACE acceptance-gate verdict: 1 == eligible for selection/side-effects,
+    # 0 == gate-rejected. Defaults to 1 so gate-off runs and pre-migration
+    # rows behave identically to stock (every selection query filters on it).
+    gate_passed: int = 1
     children_count: int = 0
 
     # Derived features
@@ -440,6 +445,7 @@ class ProgramDatabase:
                 embedding_pca_3d TEXT, -- JSON serialized List[float]
                 embedding_cluster_id INTEGER,
                 correct BOOLEAN DEFAULT 0,  -- Correct (0=False, 1=True)
+                gate_passed INTEGER DEFAULT 1,  -- PACE gate verdict (1=eligible, 0=rejected)
                 children_count INTEGER NOT NULL DEFAULT 0,
                 metadata TEXT,      -- JSON serialized Dict[str, Any]
                 migration_history TEXT, -- JSON of migration events
@@ -561,6 +567,21 @@ class ProgramDatabase:
                 logger.info("Successfully added system_prompt_id column")
         except sqlite3.Error as e:
             logger.error(f"Error during system_prompt_id migration: {e}")
+
+        # Migration 2b: Add gate_passed column (PACE acceptance gate) if missing.
+        # DEFAULT 1 means existing rows and gate-off runs stay eligible, keeping
+        # selection queries (which now filter on gate_passed) behaviour-neutral.
+        try:
+            if "gate_passed" not in columns:
+                logger.info("Adding gate_passed column to programs table")
+                self.cursor.execute(
+                    "ALTER TABLE programs ADD COLUMN gate_passed INTEGER DEFAULT 1"
+                )
+                self.conn.commit()
+                logger.info("Successfully added gate_passed column")
+        except sqlite3.Error as e:
+            logger.error(f"Error during gate_passed migration: {e}")
+            # Don't raise - this is not critical for existing functionality
 
         # Migration 3: Restore legacy compute_time semantics when detailed
         # pipeline timing is present. compute_time should mirror evaluation
@@ -869,10 +890,10 @@ class ProgramDatabase:
                     combined_score, public_metrics, private_metrics,
                     text_feedback, complexity, embedding, embedding_pca_2d,
                     embedding_pca_3d, embedding_cluster_id, correct,
-                    children_count, metadata, island_idx, migration_history,
-                    system_prompt_id)
+                    gate_passed, children_count, metadata, island_idx,
+                    migration_history, system_prompt_id)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?)
+                           ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     program.id,
@@ -894,6 +915,7 @@ class ProgramDatabase:
                     embedding_pca_3d_json,
                     program.embedding_cluster_id,
                     program.correct,
+                    program.gate_passed,
                     program.children_count,
                     metadata_json,
                     program.island_idx,
@@ -1143,6 +1165,52 @@ class ProgramDatabase:
         return self._program_from_row(row)
 
     @db_retry()
+    def set_gate_verdict(
+        self, program_id: str, passed: bool, pace: Dict[str, Any]
+    ) -> None:
+        """Atomically persist a PACE acceptance-gate verdict for a program.
+
+        Writes the ``gate_passed`` column and merges the verdict under
+        ``metadata['pace']`` in a *single* SQL statement, so the flag and the
+        recorded verdict can never diverge (the previous split ``gate_passed``
+        update + deferred metadata flush could leave the column and metadata
+        inconsistent if the process died in between).
+
+        The merge is done with SQLite's JSON1 ``json_set`` in the ``UPDATE``
+        itself - ``metadata = json_set(COALESCE(metadata, '{}'), '$.pace',
+        json(?))`` - rather than a read-modify-write in Python. There is no
+        SELECT step, so there is no lost-update window: a concurrent writer that
+        touches a *different* metadata key before or after this call is not
+        clobbered (json_set updates only the ``$.pace`` path and preserves every
+        other key), whereas the old SELECT-merge-UPDATE could silently drop such
+        a concurrent write.
+
+        Args:
+            program_id: ID of the program whose verdict is being recorded.
+            passed: True when the candidate is accepted (eligible for
+                selection/side-effects), False when the gate rejects it.
+            pace: The serialised :class:`~shinka.core.acceptance.GateVerdict`
+                (``verdict.to_dict()``) to merge under ``metadata['pace']``.
+        """
+        if not self.cursor or not self.conn:
+            raise ConnectionError("DB not connected.")
+        # Single atomic statement: no read step -> no lost-update window against
+        # a concurrent writer of some other metadata key. ``json(?)`` parses the
+        # verdict JSON so it is stored as a nested object (not a quoted string),
+        # matching the shape the sweep reads via ``json_extract``. A non-existent
+        # id updates zero rows, a harmless no-op (the in-memory verdict remains
+        # authoritative and is flushed later).
+        self.cursor.execute(
+            "UPDATE programs "
+            "SET gate_passed = ?, "
+            "    metadata = json_set(COALESCE(metadata, '{}'), "
+            "'$.pace', json(?)) "
+            "WHERE id = ?",
+            (1 if passed else 0, json.dumps(pace), program_id),
+        )
+        self.conn.commit()
+
+    @db_retry()
     def get_ancestry(self, program_id: str, max_ancestors: int = 10) -> List[Program]:
         """
         Get the ancestry (lineage) of a program by walking up the parent chain.
@@ -1328,7 +1396,8 @@ class ProgramDatabase:
         if not self.island_manager.are_all_islands_initialized():
             # Check if there are any correct programs at all
             self.cursor.execute(
-                "SELECT COUNT(*) as cnt FROM programs WHERE correct = 1"
+                "SELECT COUNT(*) as cnt FROM programs "
+                f"WHERE {eligible_sql()}"
             )
             correct_count = self.cursor.fetchone()["cnt"]
 
@@ -1556,19 +1625,23 @@ class ProgramDatabase:
         # Attempt to use tracked best_program_id first if no specific metric
         if metric is None and self.best_program_id:
             program = self.get(self.best_program_id)
-            if program and program.correct:  # Ensure best program is correct
+            # Ensure best program is correct and gate-eligible (gate_passed
+            # defaults to 1, so this is behaviour-neutral when the gate is off).
+            if program and program.correct and program.gate_passed:
                 return program
-            else:  # Stale ID or incorrect program
+            else:  # Stale ID, incorrect, or gate-rejected program
                 logger.warning(
                     f"Tracked best_program_id '{self.best_program_id}' "
-                    "not found or incorrect. Re-evaluating."
+                    "not found, incorrect, or gate-rejected. Re-evaluating."
                 )
                 if not self.read_only:
                     self._update_metadata_in_db("best_program_id", None)
                 self.best_program_id = None
 
-        # Fetch only correct programs and sort in Python.
-        self.cursor.execute("SELECT * FROM programs WHERE correct = 1")
+        # Fetch only correct, gate-eligible programs and sort in Python.
+        self.cursor.execute(
+            f"SELECT * FROM programs WHERE {eligible_sql()}"
+        )
         all_rows = self.cursor.fetchall()
         if not all_rows:
             logger.debug("No correct programs found in database.")
@@ -1778,8 +1851,11 @@ class ProgramDatabase:
         if not self.cursor:
             raise ConnectionError("DB not connected.")
 
-        # Add correctness filter to WHERE clause if requested
-        correctness_filter = "WHERE correct = 1" if correct_only else ""
+        # Add correctness filter to WHERE clause if requested. When restricting
+        # to correct programs we also require gate_passed = 1 so gate-rejected
+        # candidates are never surfaced as top-k/selection material (behaviour-
+        # neutral when the gate is off, since gate_passed defaults to 1).
+        correctness_filter = f"WHERE {eligible_sql()}" if correct_only else ""
 
         # Try to use SQL for sorting when possible for better performance
         if metric == "combined_score":
@@ -1789,7 +1865,7 @@ class ProgramDatabase:
                 WHERE combined_score IS NOT NULL
             """
             if correct_only:
-                base_query += " AND correct = 1"
+                base_query += f" AND {eligible_sql()}"
             base_query += " ORDER BY combined_score DESC LIMIT ?"
 
             self.cursor.execute(base_query, (n,))
@@ -2210,6 +2286,15 @@ class ProgramDatabase:
             logger.debug(f"Program {program.id} not added to archive (not correct).")
             return
 
+        # Withhold PACE gate-rejected candidates from archive admission (Door 1).
+        # gate_passed defaults to 1, so this is behaviour-neutral when the gate
+        # is off; it is only 0 when an enabled gate rejected the candidate.
+        if not program.gate_passed:
+            logger.debug(
+                f"Program {program.id} not added to archive (PACE gate rejected)."
+            )
+            return
+
         self.cursor.execute("SELECT COUNT(*) FROM archive")
         count = (self.cursor.fetchone() or [0])[0]
 
@@ -2336,6 +2421,14 @@ class ProgramDatabase:
         # Only consider correct programs for best program tracking
         if not program.correct:
             logger.debug(f"Program {program.id} not considered for best (not correct).")
+            return
+
+        # Withhold PACE gate-rejected candidates from best-program tracking
+        # (Door 1). Behaviour-neutral when the gate is off (gate_passed == 1).
+        if not program.gate_passed:
+            logger.debug(
+                f"Program {program.id} not considered for best (PACE gate rejected)."
+            )
             return
 
         current_best_p = None
@@ -2987,7 +3080,7 @@ class ProgramDatabase:
                 WHERE combined_score IS NOT NULL
             """
             if correct_only:
-                base_query += " AND correct = 1"
+                base_query += f" AND {eligible_sql()}"
             base_query += " ORDER BY combined_score DESC LIMIT ?"
 
             cursor.execute(base_query, (n,))

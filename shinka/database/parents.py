@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from typing import Optional, Callable, Any, Tuple
 import numpy as np  # type: ignore
 
+from .eligibility import eligible_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -109,13 +111,17 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
         # Try to sample from archive first, with fallbacks if empty
         if self.island_idx is not None:
             self.cursor.execute(
-                """SELECT a.program_id FROM archive a
+                f"""SELECT a.program_id FROM archive a
                    JOIN programs p ON a.program_id = p.id
-                   WHERE p.island_idx = ?""",
+                   WHERE p.island_idx = ? AND {eligible_sql("p")}""",
                 (self.island_idx,),
             )
         else:
-            self.cursor.execute("SELECT program_id FROM archive")
+            self.cursor.execute(
+                f"""SELECT a.program_id FROM archive a
+                   JOIN programs p ON a.program_id = p.id
+                   WHERE {eligible_sql("p")}"""
+            )
 
         archived_rows = self.cursor.fetchall()
 
@@ -160,15 +166,15 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
 
         if self.island_idx is not None:
             self.cursor.execute(
-                """SELECT p.id FROM programs p
-                   WHERE p.correct = 1 AND p.island_idx = ?
+                f"""SELECT p.id FROM programs p
+                   WHERE {eligible_sql("p")} AND p.island_idx = ?
                    ORDER BY p.combined_score DESC""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """SELECT p.id FROM programs p
-                   WHERE p.correct = 1
+                f"""SELECT p.id FROM programs p
+                   WHERE {eligible_sql("p")}
                    ORDER BY p.combined_score DESC"""
             )
 
@@ -208,14 +214,14 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
         # Last resort: any correct program
         if self.island_idx is not None:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE correct = 1 AND island_idx = ?
+                f"""SELECT id FROM programs
+                   WHERE {eligible_sql()} AND island_idx = ?
                    ORDER BY RANDOM() LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """SELECT id FROM programs WHERE correct = 1
+                f"""SELECT id FROM programs WHERE {eligible_sql()}
                    ORDER BY RANDOM() LIMIT 1"""
             )
         row = self.cursor.fetchone()
@@ -241,21 +247,21 @@ class WeightedSamplingStrategy(ParentSamplingStrategy):
         # Fetch all programs from the archive.
         if self.island_idx is not None:
             self.cursor.execute(
-                """
+                f"""
                 SELECT p.*
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.correct = 1 AND p.island_idx = ?
+                WHERE {eligible_sql("p")} AND p.island_idx = ?
                 """,
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """
+                f"""
                 SELECT p.*
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.correct = 1
+                WHERE {eligible_sql("p")}
                 """
             )
         archive_rows = self.cursor.fetchall()
@@ -278,14 +284,14 @@ class WeightedSamplingStrategy(ParentSamplingStrategy):
             # Fallback to random correct program
             if self.island_idx is not None:
                 self.cursor.execute(
-                    """SELECT id FROM programs
-                       WHERE correct = 1 AND island_idx = ?
+                    f"""SELECT id FROM programs
+                       WHERE {eligible_sql()} AND island_idx = ?
                        ORDER BY RANDOM() LIMIT 1""",
                     (self.island_idx,),
                 )
             else:
                 self.cursor.execute(
-                    """SELECT id FROM programs WHERE correct = 1
+                    f"""SELECT id FROM programs WHERE {eligible_sql()}
                        ORDER BY RANDOM() LIMIT 1"""
                 )
             row = self.cursor.fetchone()
@@ -525,7 +531,7 @@ class BeamSearchSamplingStrategy(ParentSamplingStrategy):
 
         # Final fallback
         self.cursor.execute(
-            "SELECT id FROM programs WHERE correct = 1 ORDER BY RANDOM() LIMIT 1"
+            f"SELECT id FROM programs WHERE {eligible_sql()} ORDER BY RANDOM() LIMIT 1"
         )
         row = self.cursor.fetchone()
         return self.get_program(row["id"]) if row else None
@@ -538,15 +544,15 @@ class BestOfNSamplingStrategy(ParentSamplingStrategy):
         # Find the initial program (generation 0) in the specified island or globally
         if self.island_idx is not None:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE generation = 0 AND island_idx = ? AND correct = 1
+                f"""SELECT id FROM programs
+                   WHERE generation = 0 AND island_idx = ? AND {eligible_sql()}
                    ORDER BY id LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE generation = 0 AND correct = 1
+                f"""SELECT id FROM programs
+                   WHERE generation = 0 AND {eligible_sql()}
                    ORDER BY id LIMIT 1"""
             )
 
@@ -569,15 +575,15 @@ class BestOfNSamplingStrategy(ParentSamplingStrategy):
         )
         if self.island_idx is not None:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE correct = 1 AND island_idx = ?
+                f"""SELECT id FROM programs
+                   WHERE {eligible_sql()} AND island_idx = ?
                    ORDER BY generation ASC, id ASC LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE correct = 1
+                f"""SELECT id FROM programs
+                   WHERE {eligible_sql()}
                    ORDER BY generation ASC, id ASC LIMIT 1"""
             )
 
@@ -606,15 +612,15 @@ class SequentialSamplingStrategy(ParentSamplingStrategy):
         # in the specified island or globally
         if self.island_idx is not None:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE correct = 1 AND island_idx = ?
+                f"""SELECT id FROM programs
+                   WHERE {eligible_sql()} AND island_idx = ?
                    ORDER BY generation DESC, id DESC LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """SELECT id FROM programs
-                   WHERE correct = 1
+                f"""SELECT id FROM programs
+                   WHERE {eligible_sql()}
                    ORDER BY generation DESC, id DESC LIMIT 1"""
             )
 
@@ -695,11 +701,13 @@ class CombinedParentSelector:
         """Check if there are any correct programs in the database."""
         if island_idx is not None:
             self.cursor.execute(
-                "SELECT COUNT(*) FROM programs WHERE correct = 1 AND island_idx = ?",
+                f"SELECT COUNT(*) FROM programs WHERE {eligible_sql()} AND island_idx = ?",
                 (island_idx,),
             )
         else:
-            self.cursor.execute("SELECT COUNT(*) FROM programs WHERE correct = 1")
+            self.cursor.execute(
+                f"SELECT COUNT(*) FROM programs WHERE {eligible_sql()}"
+            )
         count = self.cursor.fetchone()[0]
         return count > 0
 
@@ -843,8 +851,8 @@ class CombinedParentSelector:
             # Final fallback: random correct program
             if island_idx is not None:
                 self.cursor.execute(
-                    """SELECT id FROM programs 
-                       WHERE correct = 1 AND island_idx = ?
+                    f"""SELECT id FROM programs
+                       WHERE {eligible_sql()} AND island_idx = ?
                        ORDER BY RANDOM() LIMIT 1""",
                     (island_idx,),
                 )

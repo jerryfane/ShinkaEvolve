@@ -1,6 +1,7 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import List, Optional, Union
 
+from shinka.core.acceptance import AcceptanceGateConfig
 from shinka.llm import BanditBase
 from shinka.defaults import (
     DEFAULT_TASK_SYS_MSG,
@@ -69,3 +70,29 @@ class EvolutionConfig:
     prompt_epsilon: float = 0.1
     prompt_evo_top_k_programs: int = 3
     prompt_percentile_recompute_interval: int = 20
+
+    # PACE anytime-valid acceptance gate. ``None`` (default) is equivalent to a
+    # disabled gate: behaviour is byte-identical to stock ShinkaEvolve. Supply an
+    # AcceptanceGateConfig (or a plain mapping from a YAML/Hydra surface, which is
+    # coerced in ``__post_init__``) with ``enabled=True`` to activate it.
+    acceptance_gate: Optional[AcceptanceGateConfig] = None
+
+    def __post_init__(self) -> None:
+        # Coerce a mapping (e.g. a Hydra/OmegaConf DictConfig or a plain dict
+        # coming from ``EvolutionConfig(**configs["evo_config"])``) into a typed
+        # AcceptanceGateConfig so the runner can rely on attribute access.
+        gate = self.acceptance_gate
+        if gate is not None and not isinstance(gate, AcceptanceGateConfig):
+            gate_kwargs = dict(gate)
+            try:
+                self.acceptance_gate = AcceptanceGateConfig(**gate_kwargs)
+            except TypeError:
+                # A raw TypeError from unexpected keyword arguments is opaque;
+                # translate it into an actionable message that names the bad
+                # keys and the valid ones.
+                valid = [f.name for f in fields(AcceptanceGateConfig)]
+                bad = sorted(set(gate_kwargs) - set(valid))
+                raise ValueError(
+                    f"acceptance_gate: unknown keys {bad}; "
+                    f"valid keys: {valid}"
+                ) from None

@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .complexity import analyze_code_metrics
 from .dbase import Program, ProgramDatabase
+from .eligibility import eligible_sql
 
 logger = logging.getLogger(__name__)
 
@@ -716,6 +717,83 @@ class AsyncProgramDatabase:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.write_executor, update_metadata_sync)
 
+    async def set_gate_verdict_async(
+        self, program_id: str, passed: bool, pace: Dict[str, Any]
+    ) -> None:
+        """Atomically persist a PACE gate verdict on the dedicated writer lane.
+
+        Thin async wrapper around :meth:`ProgramDatabase.set_gate_verdict`: the
+        column update and the ``metadata['pace']`` merge happen in one
+        transaction on one connection, so the flag and the verdict can never
+        diverge.
+
+        Args:
+            program_id: ID of the program whose verdict is being recorded.
+            passed: True when the candidate is accepted (eligible for
+                selection/side-effects), False when the gate rejects it.
+            pace: The serialised gate verdict to merge under
+                ``metadata['pace']``.
+        """
+
+        def set_gate_verdict_sync():
+            thread_db = None
+            try:
+                thread_db = ProgramDatabase(
+                    self.sync_db.config,
+                    embedding_model=self.sync_db.embedding_model,
+                )
+                thread_db.set_gate_verdict(program_id, passed, pace)
+            finally:
+                if thread_db is not None:
+                    thread_db.close()
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self.write_executor, set_gate_verdict_sync)
+
+    async def get_programs_pending_side_effects_async(
+        self, limit: int
+    ) -> List[Program]:
+        """Return programs whose post-persistence side effects never completed.
+
+        These are rows missing the ``postprocess_side_effects_applied`` metadata
+        flag - either because the process died mid-side-effect or because a
+        fail-closed pending insert was never judged. The runner re-enqueues them
+        on resume; re-judging is idempotent (a persisted verdict is reused and
+        the ``gate_passed`` column self-heals). Bounded by ``limit`` and ordered
+        oldest-first so the sweep is deterministic and cannot blow up memory.
+
+        Only *judged candidates* (``parent_id IS NOT NULL``) are swept. The
+        gen-0 initial program and island copies have no parent and are
+        pipeline-external - they never pass through the proposal/evaluation
+        side-effect path, so they must never be re-enqueued for it.
+        """
+
+        def query_sync() -> List[Program]:
+            thread_db = None
+            try:
+                thread_db = ProgramDatabase(self.sync_db.config, read_only=True)
+                thread_db.cursor.execute(
+                    "SELECT * FROM programs "
+                    "WHERE parent_id IS NOT NULL "
+                    "  AND ("
+                    "    metadata IS NULL "
+                    "    OR json_valid(metadata) = 0 "
+                    "    OR json_extract(metadata, "
+                    "'$.postprocess_side_effects_applied') IS NULL "
+                    "  ) "
+                    "ORDER BY timestamp ASC LIMIT ?",
+                    (int(limit),),
+                )
+                rows = thread_db.cursor.fetchall()
+                programs = [thread_db._program_from_row(row) for row in rows]
+                return [p for p in programs if p is not None]
+            finally:
+                if thread_db is not None:
+                    thread_db.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, query_sync)
+
     def _schedule_embedding_recomputation(self):
         """Schedule embedding recomputation as a background task."""
         # Cancel any existing recomputation task
@@ -1238,7 +1316,7 @@ class AsyncProgramDatabase:
                     if correct_only:
                         thread_db.cursor.execute(
                             "SELECT combined_score FROM programs "
-                            "WHERE correct = 1 AND combined_score IS NOT NULL"
+                            f"WHERE {eligible_sql()} AND combined_score IS NOT NULL"
                         )
                     else:
                         thread_db.cursor.execute(

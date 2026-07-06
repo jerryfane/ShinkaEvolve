@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from typing import Any, List
 import numpy as np
 
+from .eligibility import eligible_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,7 +53,7 @@ class IslandSampler(ABC):
         query = f"""
             SELECT island_idx, COUNT(*) as count
             FROM programs
-            WHERE island_idx IN ({placeholders}) AND correct = 1
+            WHERE island_idx IN ({placeholders}) AND {eligible_sql()}
             GROUP BY island_idx
         """
         self.cursor.execute(query, island_indices)
@@ -78,7 +80,7 @@ class IslandSampler(ABC):
         query = f"""
             SELECT island_idx, MAX(combined_score) as best_fitness
             FROM programs
-            WHERE island_idx IN ({placeholders}) AND correct = 1
+            WHERE island_idx IN ({placeholders}) AND {eligible_sql()}
             GROUP BY island_idx
         """
         self.cursor.execute(query, island_indices)

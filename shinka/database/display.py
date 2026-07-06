@@ -8,6 +8,8 @@ from rich.columns import Columns as RichColumns  # type: ignore
 from rich.console import Console as RichConsole  # type: ignore
 from rich.table import Table as RichTable  # type: ignore
 
+from .eligibility import eligible_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -244,7 +246,9 @@ class DatabaseDisplay:
         summary_table.add_row("Total Programs", total_programs_display)
 
         # Correctness info
-        self.cursor.execute("SELECT COUNT(*) FROM programs WHERE correct = 1")
+        self.cursor.execute(
+            f"SELECT COUNT(*) FROM programs WHERE {eligible_sql()}"
+        )
         correct_programs = (self.cursor.fetchone() or [0])[0]
         correct_percentage = (
             (correct_programs / total_programs * 100) if total_programs > 0 else 0
@@ -404,7 +408,7 @@ class DatabaseDisplay:
             "combined_score, public_metrics, private_metrics, "
             "complexity, embedding, metadata, correct, island_idx, "
             "children_count "
-            "FROM programs WHERE combined_score IS NOT NULL AND correct = 1 "
+            f"FROM programs WHERE combined_score IS NOT NULL AND {eligible_sql()} "
             "ORDER BY combined_score DESC LIMIT 10"
         )
         self.cursor.execute(query)

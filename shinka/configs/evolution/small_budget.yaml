@@ -18,3 +18,16 @@ evo_config:
   embedding_model: "text-embedding-3-small"
   enable_controlled_oversubscription: false
   results_dir: ${output_dir}
+  # PACE anytime-valid acceptance gate. Omitted (null) by default: behaviour is
+  # byte-identical to stock ShinkaEvolve. Uncomment to activate; the mapping is
+  # coerced into an AcceptanceGateConfig. Requires the task to publish a paired
+  # per-instance vector at metrics['private']['instance_scores'] = {seed: score}.
+  # acceptance_gate:
+  #   enabled: true
+  #   alpha: 0.05            # wealth commit target = 1 / alpha
+  #   lam: 0.5               # betting fraction per discordant pair
+  #   max_pairs: null        # optional cap on discordant bets (eval budget)
+  #   min_discordant: 1
+  #   determinism_autodisable: true
+  #   gate_bandit: false     # Door 3: delta-0 bandit reward for non-commits
+  #   gate_scratchpad: false # Door 4: exclude non-commits from meta scratchpad

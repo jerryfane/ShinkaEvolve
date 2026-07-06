@@ -207,6 +207,7 @@ def test_process_single_job_safely_persists_timing_metadata():
         runner.async_db = _FakeAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=None)
         runner.meta_summarizer = None
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -286,6 +287,7 @@ def test_process_single_job_uses_completion_detection_time_for_eval_finish():
         runner.async_db = _FakeAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=None)
         runner.meta_summarizer = None
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -348,6 +350,7 @@ def test_process_single_job_safely_flushes_metadata_once_after_side_effects():
         runner.async_db = _FakeAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=None)
         runner.meta_summarizer = None
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -409,6 +412,7 @@ def test_process_single_job_safely_skips_duplicate_source_job():
         runner.async_db = _FakeAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=None)
         runner.meta_summarizer = None
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -473,6 +477,7 @@ def test_process_single_job_safely_reuses_existing_row_when_duplicate_matches():
         runner.async_db = _FakeAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=5)
         runner.meta_summarizer = _FakeMetaSummarizer()
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -556,6 +561,7 @@ def test_process_single_job_safely_ignores_duplicate_marker_on_existing_row():
         runner.async_db = _FakeAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=5)
         runner.meta_summarizer = _FakeMetaSummarizer()
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -633,6 +639,7 @@ def test_process_single_job_safely_reuses_initial_eval_finish_time_on_retry():
         runner.async_db = _FailOnceAsyncDB()
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=None)
         runner.meta_summarizer = None
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
@@ -710,6 +717,7 @@ def test_process_completed_jobs_safely_persists_completed_jobs_concurrently():
         runner.async_db = async_db
         runner.evo_config = SimpleNamespace(evolve_prompts=False, meta_rec_interval=None)
         runner.meta_summarizer = None
+        runner.pace_gate = None
         runner.llm_selection = None
         runner.MAX_DB_RETRY_ATTEMPTS = 3
         runner.failed_jobs_for_retry = {}
