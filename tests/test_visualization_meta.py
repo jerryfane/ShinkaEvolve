@@ -503,6 +503,7 @@ def test_handle_get_database_stats_uses_best_correct_program(tmp_path):
             code TEXT,
             generation INTEGER,
             correct INTEGER,
+            gate_passed INTEGER DEFAULT 1,
             combined_score REAL,
             timestamp REAL,
             metadata TEXT
@@ -510,7 +511,9 @@ def test_handle_get_database_stats_uses_best_correct_program(tmp_path):
         """
     )
     conn.executemany(
-        "INSERT INTO programs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO programs "
+        "(id, code, generation, correct, combined_score, timestamp, metadata) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 "incorrect-best",
@@ -564,6 +567,7 @@ def test_handle_get_database_stats_returns_no_best_when_no_correct_programs(tmp_
             code TEXT,
             generation INTEGER,
             correct INTEGER,
+            gate_passed INTEGER DEFAULT 1,
             combined_score REAL,
             timestamp REAL,
             metadata TEXT
@@ -571,7 +575,9 @@ def test_handle_get_database_stats_returns_no_best_when_no_correct_programs(tmp_
         """
     )
     conn.executemany(
-        "INSERT INTO programs VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO programs "
+        "(id, code, generation, correct, combined_score, timestamp, metadata) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         [
             ("p1", "print('a')", 1, 0, 2.0, 100.0, "{}"),
             ("p2", "print('b')", 4, 0, 9.0, 130.0, "{}"),

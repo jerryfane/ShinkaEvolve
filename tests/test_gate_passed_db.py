@@ -8,12 +8,14 @@ only rows explicitly marked ``gate_passed = 0`` are withheld from selection.
 """
 
 import asyncio
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
 
 from shinka.database import DatabaseConfig, Program, ProgramDatabase
 from shinka.database.async_dbase import AsyncProgramDatabase
+from shinka.database.islands import CombinedIslandManager
 from shinka.database.parents import CombinedParentSelector
 
 
@@ -351,3 +353,143 @@ def test_default_population_is_fully_eligible_back_compat():
             assert sampled <= {"p0", "p1", "p2", "p3"}
         finally:
             db.close()
+
+
+# ---------------------------------------------------------------------------
+# Island initialization: a gate-rejected-only island is not "initialized"
+# ---------------------------------------------------------------------------
+
+
+def test_island_with_only_rejected_rows_counts_as_uninitialized():
+    """An island whose only correct rows are gate-rejected must read as
+    uninitialized so the assignment strategy reseeds it (aligning island
+    initialization with parent-selection eligibility)."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE programs (
+            id TEXT PRIMARY KEY,
+            correct INTEGER,
+            gate_passed INTEGER DEFAULT 1,
+            island_idx INTEGER
+        )
+        """
+    )
+    # Island 0 has an eligible program; island 1 has only a gate-rejected one.
+    cursor.execute("INSERT INTO programs VALUES ('a', 1, 1, 0)")
+    cursor.execute("INSERT INTO programs VALUES ('b', 1, 0, 1)")
+    conn.commit()
+
+    config = type("Cfg", (), {"num_islands": 2})()
+    manager = CombinedIslandManager(cursor=cursor, conn=conn, config=config)
+
+    # Island 1 (rejected-only) is not initialized.
+    assert manager.get_initialized_islands() == [0]
+    assert manager.are_all_islands_initialized() is False
+
+    # A fresh program is reseeded onto the uninitialized island 1.
+    fresh = type(
+        "P", (), {"id": "new", "parent_id": None, "island_idx": None, "metadata": None}
+    )()
+    manager.assign_island(fresh)
+    assert fresh.island_idx == 1
+
+    # Once island 1 gains an eligible row, all islands read as initialized.
+    cursor.execute("INSERT INTO programs VALUES ('c', 1, 1, 1)")
+    conn.commit()
+    assert sorted(manager.get_initialized_islands()) == [0, 1]
+    assert manager.are_all_islands_initialized() is True
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Percentile population: gate-rejected programs are excluded
+# ---------------------------------------------------------------------------
+
+
+def test_compute_percentile_excludes_rejected_population():
+    """compute_percentile_async(correct_only=True) must rank against the
+    eligible population only, ignoring gate-rejected rows."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sync_db = _make_db(tmpdir, name="percentile.db")
+        async_db = AsyncProgramDatabase(sync_db=sync_db)
+
+        async def _run():
+            await async_db.add_program_async(_program("p0", score=1.0))
+            await async_db.add_program_async(_program("p1", score=2.0))
+            await async_db.add_program_async(_program("p2", score=3.0))
+            # Reject the low scorer so only {2.0, 3.0} remain eligible.
+            await async_db.set_gate_verdict_async("p0", False, _pace(False))
+            return await async_db.compute_percentile_async(2.5, correct_only=True)
+
+        try:
+            pct = asyncio.run(_run())
+            # Eligible scores {2.0, 3.0}: 2.5 beats one of two -> 0.5.
+            # (Including the rejected 1.0 would give 2/3.)
+            assert pct == 0.5
+        finally:
+            asyncio.run(async_db.close_async())
+            sync_db.close()
+
+
+# ---------------------------------------------------------------------------
+# Island copy preserves the source row's gate verdict
+# ---------------------------------------------------------------------------
+
+
+def test_island_copy_preserves_rejected_gate_verdict():
+    """Copying a program to other islands must carry the source's
+    ``gate_passed`` value rather than defaulting the copies to eligible."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = ProgramDatabase(
+            config=DatabaseConfig(
+                db_path=str(Path(tmpdir) / "copy.db"), num_islands=3
+            ),
+            embedding_model="",
+        )
+        try:
+            prog = _program("p0")
+            prog.gate_passed = 0
+            prog.island_idx = 0
+
+            copies = db.island_manager.copy_program_to_islands(prog)
+            assert len(copies) == 2
+
+            for copy_id in copies:
+                row = db.cursor.execute(
+                    "SELECT gate_passed FROM programs WHERE id = ?", (copy_id,)
+                ).fetchone()
+                assert row["gate_passed"] == 0
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression tripwire: the eligibility predicate lives only in eligibility.py
+# ---------------------------------------------------------------------------
+
+
+def test_no_raw_eligibility_predicate_outside_module():
+    """Guard against reintroducing the copy-pasted eligibility predicate. Every
+    selection site must go through ``eligible_sql()`` so a missed gate filter
+    can never silently surface gate-rejected programs again."""
+    shinka_root = Path(__file__).resolve().parent.parent / "shinka"
+    # Matches both the bare and table-aliased forms of the predicate.
+    predicate = re.compile(r"(?:\w+\.)?correct = 1 AND (?:\w+\.)?gate_passed = 1")
+
+    offenders = []
+    for path in shinka_root.rglob("*.py"):
+        if path.name == "eligibility.py":
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if predicate.search(line):
+                rel = path.relative_to(shinka_root.parent)
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+
+    assert not offenders, (
+        "Raw eligibility predicate found outside eligibility.py; use "
+        "eligible_sql() instead:\n" + "\n".join(offenders)
+    )

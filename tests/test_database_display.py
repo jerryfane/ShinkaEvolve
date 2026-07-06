@@ -25,6 +25,7 @@ def test_print_summary_shows_total_programs_as_stored_over_target():
             complexity REAL,
             embedding TEXT,
             correct BOOLEAN,
+            gate_passed INTEGER DEFAULT 1,
             island_idx INTEGER,
             children_count INTEGER
         )
