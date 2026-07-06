@@ -493,3 +493,29 @@ def test_no_raw_eligibility_predicate_outside_module():
         "Raw eligibility predicate found outside eligibility.py; use "
         "eligible_sql() instead:\n" + "\n".join(offenders)
     )
+
+
+def test_no_lone_accept_side_correctness_filter():
+    """Guard against a lone accept-side ``correct = 1`` filter that forgets the
+    gate. The combined-predicate tripwire above only fires once a site already
+    references ``gate_passed``; a hand-written ``WHERE ... correct = 1`` that
+    never added the gate column (as ``display.py`` originally did) would slip
+    through and surface gate-rejected programs. Any accept-side literal must
+    instead route through ``eligible_sql()``. ``correct = 0`` (the incorrect-
+    program paths) is deliberately not matched."""
+    shinka_root = Path(__file__).resolve().parent.parent / "shinka"
+    lone_accept = re.compile(r"(?:\w+\.)?correct\s*=\s*1\b")
+
+    offenders = []
+    for path in shinka_root.rglob("*.py"):
+        if path.name == "eligibility.py":
+            continue
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if lone_accept.search(line):
+                rel = path.relative_to(shinka_root.parent)
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+
+    assert not offenders, (
+        "Lone accept-side 'correct = 1' filter found; use eligible_sql() so "
+        "the gate_passed filter is never dropped:\n" + "\n".join(offenders)
+    )

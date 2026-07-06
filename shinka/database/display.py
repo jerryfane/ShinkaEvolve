@@ -408,7 +408,7 @@ class DatabaseDisplay:
             "combined_score, public_metrics, private_metrics, "
             "complexity, embedding, metadata, correct, island_idx, "
             "children_count "
-            "FROM programs WHERE combined_score IS NOT NULL AND correct = 1 "
+            f"FROM programs WHERE combined_score IS NOT NULL AND {eligible_sql()} "
             "ORDER BY combined_score DESC LIMIT 10"
         )
         self.cursor.execute(query)
