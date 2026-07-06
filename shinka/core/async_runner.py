@@ -84,6 +84,14 @@ PACE_INSTANCE_KEY = "instance_scores"
 # auto-disable.
 PACE_REASON_NO_INCUMBENT = "no_incumbent"
 
+# Sentinel distinguishing "parent not supplied" (fetch it) from an explicit
+# ``parent=None`` (no incumbent) in :meth:`ShinkaEvolveRunner._apply_pace_gate`.
+_PARENT_UNSET: Any = object()
+
+# Upper bound on how many unprocessed programs the PACE resume sweep re-enqueues
+# for side effects/judging on startup, so a huge stale backlog cannot blow up.
+RESUME_SIDE_EFFECT_SWEEP_LIMIT = 512
+
 
 def _print_gradient_logo_and_mirror(
     log_path: Optional[Path] = None,
@@ -1209,6 +1217,12 @@ class ShinkaEvolveRunner:
 
             # Update state for resuming
             await self._restore_resume_progress()
+
+            # PACE resume sweep: re-judge any program whose post-persistence side
+            # effects never completed (crash mid-side-effect, or a fail-closed
+            # pending row that was never judged). Gated on the PACE gate being
+            # enabled so a stock (gate-off) resume is byte-identical.
+            await self._resume_pace_side_effect_sweep()
         else:
             # Generate or copy initial program only if NOT resuming
             if (
@@ -4169,6 +4183,17 @@ class ShinkaEvolveRunner:
                 ),
             )
 
+            # Fail-closed pending insert: when the gate is ENABLED and this
+            # candidate will be judged (correct + has a parent incumbent), insert
+            # the row as gate_passed=0 (pending). It is thereby invisible to every
+            # selection query (which require gate_passed=1) until the atomic
+            # verdict write flips it to 1 on commit - closing the TOCTOU window
+            # where a lucky candidate could be sampled as a parent before it is
+            # judged. Guarded strictly on gate-enabled, so with the gate off the
+            # default gate_passed=1 makes this byte-identical to stock.
+            if self.pace_gate is not None and job.parent_id and correct_val:
+                program.gate_passed = 0
+
             # Add to database with timeout protection
             logger.info(
                 f"💾 DB ADD: Adding program to database for {job.job_id} (gen {job.generation})..."
@@ -4358,13 +4383,13 @@ class ShinkaEvolveRunner:
 
     def _pace_gate_bandit(self) -> bool:
         """Whether Door 3 (bandit reward) is gated (``gate_bandit`` sub-flag)."""
-        gate = getattr(self, "pace_gate", None)
-        return gate is not None and gate.config.gate_bandit
+        return self.pace_gate is not None and self.pace_gate.config.gate_bandit
 
     def _pace_gate_scratchpad(self) -> bool:
         """Whether Door 4 (meta scratchpad) is gated (``gate_scratchpad``)."""
-        gate = getattr(self, "pace_gate", None)
-        return gate is not None and gate.config.gate_scratchpad
+        return (
+            self.pace_gate is not None and self.pace_gate.config.gate_scratchpad
+        )
 
     def _pace_instance_vector(self, program: Program) -> Dict[Any, float]:
         """Recover a program's paired per-instance score vector from the DB row.
@@ -4387,20 +4412,12 @@ class ShinkaEvolveRunner:
         }
 
     def _pace_pass_through(self, reason: str) -> GateVerdict:
-        """Build a committed pass-through verdict for a structural (non-bet) case."""
-        target = self.pace_gate.config.wealth_target
-        return GateVerdict(
-            committed=True,
-            reason=reason,
-            n_pairs=0,
-            n_discordant=0,
-            n_ties=0,
-            n_wins=0,
-            final_wealth=1.0,
-            peak_wealth=1.0,
-            wealth_target=target,
-            wealth_trajectory=[1.0],
-        )
+        """Build a committed pass-through verdict for a structural (non-bet) case.
+
+        Delegates to the parametrized :meth:`PaceGate._pass_through` so the
+        pass-through verdict shape lives in one place next to the e-process.
+        """
+        return self.pace_gate._pass_through(reason)
 
     async def _append_pace_log(
         self, program: Program, verdict: GateVerdict
@@ -4434,7 +4451,7 @@ class ShinkaEvolveRunner:
             await loop.run_in_executor(None, _write)
 
     async def _apply_pace_gate(
-        self, program: Program
+        self, program: Program, parent: Any = _PARENT_UNSET
     ) -> Optional[GateVerdict]:
         """Compute and record the single PACE verdict for one candidate.
 
@@ -4442,17 +4459,28 @@ class ShinkaEvolveRunner:
         (in which case every downstream door stays byte-identical to stock). Only
         correct candidates are judged - incorrect ones are already withheld from
         every door by the ``correct = 0`` predicate, so the gate leaves them
-        untouched (``gate_passed`` stays 1).
+        untouched.
 
-        On reject, the in-memory ``program.gate_passed`` is set to 0 (so the very
-        next Door 1 archive/best admission skips it) and the flag is persisted so
-        parent/inspiration/top-K selection queries exclude the candidate. The
-        verdict is written to ``program.metadata['pace']`` and appended to
-        ``pace_log.jsonl``. On resume a previously persisted verdict is reused
-        rather than re-judged.
+        The verdict and the ``gate_passed`` column are written together in one
+        atomic transaction (:meth:`set_gate_verdict_async`): a commit flips a
+        fail-closed pending row from 0 -> 1, a reject sets it to 0, and either
+        way ``metadata['pace']`` is merged in the same write so the flag and the
+        recorded verdict can never diverge. The verdict is also mirrored to the
+        in-memory ``program.metadata['pace']`` and appended to ``pace_log.jsonl``.
+
+        On resume a previously persisted verdict is reused rather than re-judged;
+        if the persisted verdict disagrees with the in-DB ``gate_passed`` column
+        (e.g. a crash between the two legacy writes), the column is self-healed
+        via the same atomic write.
+
+        Args:
+            program: The candidate to judge.
+            parent: The already-fetched incumbent, threaded in by the caller to
+                avoid a duplicate ``get_async``. Left as ``_PARENT_UNSET`` (the
+                default) the parent is fetched here; an explicit ``None`` means
+                "no incumbent" (initial/root program).
         """
-        gate = getattr(self, "pace_gate", None)
-        if gate is None or not program.correct:
+        if self.pace_gate is None or not program.correct:
             return None
 
         # Idempotence: reuse a persisted verdict on resume, never re-judge.
@@ -4463,12 +4491,27 @@ class ShinkaEvolveRunner:
             except Exception:
                 verdict = None
             if verdict is not None:
-                program.gate_passed = 1 if verdict.committed else 0
+                expected = 1 if verdict.committed else 0
+                # Self-heal: repair the DB column when it disagrees with the
+                # reconstructed verdict (atomic re-write of column + metadata).
+                if program.gate_passed != expected:
+                    logger.info(
+                        "PACE gate: self-healing gate_passed for %s "
+                        "(column=%s -> verdict=%s).",
+                        program.id,
+                        program.gate_passed,
+                        expected,
+                    )
+                    await self.async_db.set_gate_verdict_async(
+                        program.id, verdict.committed, existing
+                    )
+                program.gate_passed = expected
                 return verdict
 
-        parent = None
-        if program.parent_id:
-            parent = await self.async_db.get_async(program.parent_id)
+        if parent is _PARENT_UNSET:
+            parent = None
+            if program.parent_id:
+                parent = await self.async_db.get_async(program.parent_id)
 
         if parent is None:
             # Initial / root program: no incumbent to beat -> auto-pass.
@@ -4480,7 +4523,7 @@ class ShinkaEvolveRunner:
         else:
             candidate_vector = self._pace_instance_vector(program)
             incumbent_vector = self._pace_instance_vector(parent)
-            verdict = gate.verdict(candidate_vector, incumbent_vector)
+            verdict = self.pace_gate.verdict(candidate_vector, incumbent_vector)
 
         if program.metadata is None:
             program.metadata = {}
@@ -4488,8 +4531,14 @@ class ShinkaEvolveRunner:
         await self._append_pace_log(program, verdict)
 
         program.gate_passed = 1 if verdict.committed else 0
+        # Atomic single-transaction write of the ``gate_passed`` column and the
+        # merged ``metadata['pace']`` verdict. Runs on both commit and reject so
+        # a fail-closed pending row (inserted with gate_passed=0) is flipped to 1
+        # on commit and the column/metadata are always consistent.
+        await self.async_db.set_gate_verdict_async(
+            program.id, verdict.committed, verdict.to_dict()
+        )
         if not verdict.committed:
-            await self.async_db.set_gate_passed_async(program.id, False)
             logger.info(
                 "PACE gate REJECT program %s (reason=%s, wealth=%.4g/%.4g, "
                 "wins=%d/%d discordant).",
@@ -4536,13 +4585,29 @@ class ShinkaEvolveRunner:
         side_effects_completed = False
 
         try:
+            # Fetch the incumbent once and thread it through both the PACE gate
+            # and the Door-3 bandit reward below (previously each issued its own
+            # ``get_async`` for the same parent). Only fetched when a consumer
+            # actually needs it, so behaviour stays byte-identical when the gate
+            # is off and there is no bandit.
+            gate_parent: Any = None
+            need_parent = bool(program.parent_id) and (
+                self.pace_gate is not None
+                or (
+                    self.llm_selection is not None
+                    and "model_name" in (program.metadata or {})
+                )
+            )
+            if need_parent:
+                gate_parent = await self.async_db.get_async(program.parent_id)
+
             # PACE acceptance gate: compute the single verdict for this candidate
             # BEFORE any side-effect door runs. On reject this flips the in-memory
             # ``program.gate_passed`` to 0 (so Door 1 archive/best admission below
             # skips it) and persists that flag (so selection queries exclude it).
             # ``pace_committed`` is True when the gate is off or passes through, so
             # every door below stays byte-identical to stock when disabled.
-            pace_verdict = await self._apply_pace_gate(program)
+            pace_verdict = await self._apply_pace_gate(program, parent=gate_parent)
             pace_committed = pace_verdict is None or pace_verdict.committed
             if pace_verdict is not None:
                 metadata_persist_needed = True
@@ -4633,29 +4698,49 @@ class ShinkaEvolveRunner:
                 program.metadata or {}
             ):
                 try:
-                    parent = None
-                    if program.parent_id:
-                        parent = await self.async_db.get_async(program.parent_id)
-                    baseline = parent.combined_score if parent else None
-                    # Door 3 (bandit): a correct-but-gate-rejected candidate feeds
-                    # a delta-0 (parent-baseline) reward when the gate_bandit
-                    # sub-flag is on, so the lucky-noise spike contributes exactly
-                    # 0 to the arm without ``None`` triggering worst-reward
-                    # imputation. Untouched legacy path otherwise.
+                    # Reuse the parent already fetched for the gate (no second
+                    # get_async).
+                    parent = gate_parent
+                    baseline = (
+                        parent.combined_score if parent is not None else None
+                    )
+                    model_name = program.metadata["model_name"]
+                    skip_update = False
                     if (
                         program.correct
                         and not pace_committed
                         and self._pace_gate_bandit()
                     ):
-                        reward = baseline
+                        # Door 3 (bandit): a correct-but-gate-rejected candidate
+                        # is fed the incumbent's own score as a NEUTRAL reward
+                        # (delta 0 against the same baseline), so the lucky-noise
+                        # spike neither rewards nor penalises the arm and the
+                        # arm's standing relies purely on the baseline shift. If
+                        # there is no incumbent, or the incumbent has no score,
+                        # there is no meaningful neutral value to feed, so we skip
+                        # the update entirely rather than impute one (which would
+                        # otherwise trigger worst-reward imputation). Caveat: with
+                        # asymmetric_scaling in the bandit a delta of exactly 0 is
+                        # not perfectly neutral, but the skip path avoids
+                        # fabricating any signal from a rejected candidate.
+                        if parent is None or parent.combined_score is None:
+                            logger.debug(
+                                "PACE Door 3: skipping bandit update for "
+                                "rejected %s (no incumbent baseline).",
+                                program.id,
+                            )
+                            skip_update = True
+                            reward = None
+                        else:
+                            reward = parent.combined_score
                     else:
                         reward = program.combined_score if program.correct else None
-                    model_name = program.metadata["model_name"]
-                    self.llm_selection.update(
-                        arm=model_name, reward=reward, baseline=baseline
-                    )
-                    if self.verbose:
-                        self.llm_selection.print_summary(console=self.console)
+                    if not skip_update:
+                        self.llm_selection.update(
+                            arm=model_name, reward=reward, baseline=baseline
+                        )
+                        if self.verbose:
+                            self.llm_selection.print_summary(console=self.console)
                 except Exception as e:
                     logger.warning(f"LLM selection update error for {job.job_id}: {e}")
                     # Don't fail the whole job for LLM selection issues
@@ -4756,6 +4841,74 @@ class ShinkaEvolveRunner:
             postprocess_started_at=postprocess_started_at,
             postprocess_finished_at=postprocess_finished_at,
         )
+
+    def _reconstruct_persisted_event_for_resume(
+        self, program: Program
+    ) -> PersistedProgramEvent:
+        """Rebuild a :class:`PersistedProgramEvent` from a persisted program row.
+
+        On resume the original :class:`AsyncRunningJob` is gone, so a synthetic
+        job carrying only the fields the side-effect path reads (ids, parent,
+        generation, timing, meta patch data) is reconstructed from the program's
+        stored metadata. Timing falls back to the program timestamp.
+        """
+        meta = program.metadata or {}
+        started = float(meta.get("pipeline_started_at", program.timestamp or time.time()))
+        eval_started = float(meta.get("evaluation_started_at", started))
+        eval_finished = float(meta.get("evaluation_finished_at", eval_started))
+        post_started = float(meta.get("postprocess_started_at", eval_finished))
+        post_finished = float(meta.get("postprocess_finished_at", post_started))
+        job = AsyncRunningJob(
+            job_id=str(meta.get("source_job_id", program.id)),
+            exec_fname="",
+            results_dir=str(self.results_dir),
+            start_time=started,
+            proposal_started_at=started,
+            evaluation_submitted_at=started,
+            generation=program.generation,
+            evaluation_started_at=eval_started,
+            parent_id=program.parent_id,
+            meta_patch_data=dict(meta),
+        )
+        return PersistedProgramEvent(
+            job=job,
+            program=program,
+            evaluation_finished_at=eval_finished,
+            postprocess_started_at=post_started,
+            postprocess_finished_at=post_finished,
+        )
+
+    async def _resume_pace_side_effect_sweep(self) -> None:
+        """Re-enqueue unprocessed programs for side effects/judging on resume.
+
+        Queries a bounded batch of rows missing the
+        ``postprocess_side_effects_applied`` flag and re-enqueues each as a
+        :class:`PersistedProgramEvent`. Re-judging is idempotent: a persisted
+        verdict is reused and the ``gate_passed`` column self-heals, while a
+        fail-closed pending row that was never judged gets its verdict now. Gated
+        on the PACE gate being enabled so a stock resume is byte-identical.
+        """
+        if self.pace_gate is None:
+            return
+        try:
+            pending = await self.async_db.get_programs_pending_side_effects_async(
+                RESUME_SIDE_EFFECT_SWEEP_LIMIT
+            )
+        except Exception as e:
+            logger.warning("PACE resume sweep query failed: %s", e)
+            return
+        if not pending:
+            return
+        logger.info(
+            "PACE resume sweep: re-enqueueing %d unprocessed program(s) for "
+            "side effects/judging.",
+            len(pending),
+        )
+        events = [
+            self._reconstruct_persisted_event_for_resume(program)
+            for program in pending
+        ]
+        await self._enqueue_background_side_effects(events)
 
     async def _mark_completed_jobs_detected(
         self, completed_jobs: List[AsyncRunningJob]
