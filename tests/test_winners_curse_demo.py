@@ -1,4 +1,4 @@
-"""Fast smoke test for the PACE winner's-curse A/B demo (both regimes).
+"""Fast smoke test for the PACE winner's-curse A/B/C demo (both regimes).
 
 Runs a tiny config (T=10, 2 seeds) end to end over BOTH regimes and asserts the
 demo:
@@ -6,15 +6,19 @@ demo:
 * runs against the real gate + real ``ProgramDatabase`` without error,
 * produces both artifacts (``results.json`` + ``winners_curse.png``),
 * returns a well-formed results dict keyed by regime (``planted`` +
-  ``null_only``), each with the right shape and audit-labelled fields, and
+  ``null_only``), each with the right shape and audit-labelled fields (including
+  the per-arm std + pooled false-commit reporting), and
 * reproduces, *in every regime*, the qualitative direction the demo exists to
-  show: the PACE-gated arm commits no more false positives than stock greedy.
+  show: the PACE-gated arm commits no more false positives than **either**
+  greedy arm -- the ``pace`` vs ``greedy_reeval`` contrast (same 2x eval cost,
+  gate-vs-no-gate) being the deconfounded measure of the gate's effect.
 
 This is a *smoke* test, not a statistical one: with only 2 seeds the exact
-numbers are noisy, so we assert the robust inequality (gated <= greedy) rather
-than a magnitude. The ``null_only`` regime additionally checks the construction
-invariant that true quality never rises above baseline (no genuine improvement
-exists), so any greedy commit there is pure winner's-curse churn.
+numbers are noisy, so we assert robust inequalities (gated <= each greedy arm on
+false-commit *counts*) rather than magnitudes. The ``null_only`` regime
+additionally checks the construction invariant that true quality never rises
+above baseline (no genuine improvement exists), so any greedy commit there is
+pure winner's-curse churn.
 """
 
 import importlib.util
@@ -57,14 +61,18 @@ def test_demo_runs_and_shows_gate_effect(tmp_path):
     # Top-level shape: results are keyed by regime, both regimes present.
     assert set(results.keys()) == set(demo.REGIMES) == {"planted", "null_only"}
 
+    # Three arms are present and named as expected.
+    assert demo.ARMS == ["greedy", "greedy_reeval", "pace"]
+
     for regime in demo.REGIMES:
         block = results[regime]
         runs = block["runs"]
 
-        # Well-formed shape: 2 seeds x 2 arms, config labelled with the regime.
+        # Well-formed shape: 2 seeds x 3 arms, config labelled with the regime.
         assert block["config"]["regime"] == regime
-        assert len(runs) == 2 * cfg.n_seeds
-        assert {r["arm"] for r in runs} == {"greedy", "pace"}
+        assert block["config"]["sigma_inst"] == cfg.sigma_inst  # paired difficulty
+        assert len(runs) == len(demo.ARMS) * cfg.n_seeds
+        assert {r["arm"] for r in runs} == set(demo.ARMS)
 
         # Every run carries the audit-labelled fields.
         for r in runs:
@@ -72,14 +80,29 @@ def test_demo_runs_and_shows_gate_effect(tmp_path):
             assert "reached_optimum" in r
             assert "winners_curse_gap" in r
 
-        greedy, pace = block["summary"]["greedy"], block["summary"]["pace"]
+        summ = block["summary"]
+        greedy = summ["greedy"]
+        greedy_reeval = summ["greedy_reeval"]
+        pace = summ["pace"]
+
+        # New reporting: every arm summary carries per-seed std + pooled
+        # false-commit fields (means alone are no longer the whole story).
+        for arm_summary in (greedy, greedy_reeval, pace):
+            assert "false_commits_std" in arm_summary
+            assert "false_commit_rate_pooled" in arm_summary
+            assert "n_commits_total" in arm_summary
+
+        # Eval-cost decomposition: greedy_reeval and pace pay the SAME (2x) eval
+        # cost -- they differ only in the decision rule -- while frozen greedy
+        # pays 1x. This is what makes pace-vs-greedy_reeval the deconfounded
+        # measure of the gate's effect.
+        assert greedy_reeval["dev_evals_mean"] == pace["dev_evals_mean"]
+        assert greedy["dev_evals_mean"] < greedy_reeval["dev_evals_mean"]
 
         # Qualitative direction the demo demonstrates, in EVERY regime: the gate
-        # does not commit more false positives than greedy (it commits fewer).
-        assert (
-            pace["false_commit_rate_mean"]
-            <= greedy["false_commit_rate_mean"] + 1e-9
-        )
+        # commits no more false positives than EITHER greedy arm (it commits
+        # fewer). pace <= greedy_reeval is the deconfounded, same-cost contrast.
+        assert pace["false_commits_mean"] <= greedy_reeval["false_commits_mean"] + 1e-9
         assert pace["false_commits_mean"] <= greedy["false_commits_mean"] + 1e-9
 
     # null_only construction invariant: NO genuine improvement exists, so true

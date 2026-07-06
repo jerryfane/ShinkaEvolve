@@ -1,42 +1,73 @@
-"""A/B winner's-curse demo for the PACE acceptance gate (no LLM calls).
+"""A/B/C winner's-curse demo for the PACE acceptance gate (no LLM calls).
 
 This is a *synthetic, controlled* experiment. It fabricates a stream of
 candidate programs whose TRUE quality is known by construction (a per-instance
-success probability ``p_true``) and runs each candidate through two competing
-acceptance rules:
+success probability ``p_true``) and runs each candidate through three competing
+acceptance rules that **decompose** the effect of the PACE gate:
 
-* **Arm A - stock greedy**: accept a candidate iff its dev score beats the
-  incumbent's dev score (the ubiquitous "did the number go up?" rule).
-* **Arm B - PACE-gated**: accept iff the *real* PACE acceptance gate commits
-  (an anytime-valid e-process over the McNemar-discordant pairs of a paired
-  candidate/incumbent comparison, ``alpha=0.05``, ``lam=0.5``).
+* **``greedy`` (frozen)** - accept iff the candidate's dev score beats the
+  incumbent's *frozen stored* dev score (the ubiquitous "did the number go up?"
+  rule). That stored score is itself a winner's-cursed maximum, so it is an
+  inflated bar.
+* **``greedy_reeval`` (re-eval, no gate)** - re-evaluates the incumbent *fresh
+  every round* on the same paired instances (the exact eval cost and protocol
+  PACE pays), then applies the *greedy* rule: accept iff the candidate's dev
+  mean beats the incumbent's *re-evaluated* dev mean. This removes the
+  frozen-inflated-score confound but keeps the naive decision rule.
+* **``pace`` (re-eval + gate)** - re-evaluates the incumbent fresh every round
+  (identically to ``greedy_reeval``) and accepts iff the *real* PACE acceptance
+  gate commits (an anytime-valid e-process over the McNemar-discordant pairs of
+  the paired comparison, ``alpha=0.05``, ``lam=0.5``).
 
-Both arms hill-climb an evolving incumbent. The point is to expose the
-**winner's curse**: greedy selection on noisy dev scores systematically admits
-lucky-noise candidates and inflates the reported best score above its true
-quality, whereas the statistically-disciplined gate holds the false-commit rate
-near ``alpha`` and keeps the reported score honest.
+Because ``greedy_reeval`` and ``pace`` share the *same* eval cost and re-eval
+protocol and differ **only** in the decision rule, the contrast between them
+isolates the gate's marginal effect. The three-arm decomposition reads as:
+
+    greedy  --[remove frozen-score confound]-->  greedy_reeval
+    greedy_reeval  --[swap greedy rule for the e-process gate]-->  pace
+
+So ``pace`` vs ``greedy_reeval`` is the clean, deconfounded measure of what the
+gate itself buys; ``greedy`` vs ``greedy_reeval`` shows what re-evaluation alone
+does (spoiler: on its own it does not tame false commits - it can make churn
+worse, because a re-evaluated incumbent regresses toward its true mean and is
+easier to beat by noise).
+
+**What ``alpha`` does and does not promise (read this before quoting a rate).**
+The gate's e-process gives an anytime-valid guarantee **per comparison**: by
+Ville's inequality the probability that a *single* null candidate ever commits
+is bounded by ``alpha``. It does **not** bound the number of false commits over
+a whole run. A run streams ~``T`` sequential comparisons, so the *expected*
+false commits under the null is roughly ``(per-comparison false-commit rate) x
+T`` - a per-comparison bound, multiplied by the number of comparisons. There is
+no run-level (family-wise) control here; that is the job of the wealth-ledger
+layer (a global betting budget across comparisons), which is **out of scope**
+for this mechanism demo. Do not read the per-run false-commit count as "near
+``alpha``": it is an accumulation of many per-comparison bets.
 
 Mirroring the PACE paper's two-regime design (arXiv 2606.08106 §5.1/§5.2), the
-demo runs **both arms under two regimes**:
+demo runs **all three arms under two regimes**:
 
 * **``planted``** - the original setup: most candidates are nulls, a few planted
-  rounds are genuine improvements/regressions. Here both arms capture the
-  planted improvement, but greedy pays for it with far more false commits. This
-  regime demonstrates *equal power + false-commit suppression*.
+  rounds are genuine improvements/regressions. Here all arms can capture the
+  planted improvement, but the greedy rules pay for it with far more false
+  commits. This regime demonstrates *power + false-commit suppression*.
 * **``null_only``** - every candidate is a true null (``p_true == p_base``, the
   incumbent's own true quality) plus a few true regressions; there is **no**
   genuine improvement anywhere in the stream. True quality can never rise, so
   every greedy commit is a false improvement (churn) and its reported-best dev
   score is *pure winner's curse* - a large reported-minus-true gap over a true
-  quality pinned at baseline. PACE commits far fewer (its false-commit rate is
-  bounded by the anytime-valid ``alpha`` over the sequential comparisons) and
-  keeps the reported best much closer to the true baseline.
+  quality pinned at baseline. PACE commits far fewer and keeps the reported best
+  much closer to the true baseline.
 
-The champion-gap metric (reported-best dev minus its true quality) only cleanly
-separates the arms when *no true improvement dominates* the stream - which is
-exactly why both regimes exist: ``planted`` shows the arms are equally powered,
-``null_only`` isolates the champion winner's curse.
+**Real paired difficulty.** Dev instances are heterogeneous: each round draws a
+per-instance difficulty offset ``e_i ~ Normal(0, sigma_inst)`` (clipped so the
+success probability stays in ``[0.05, 0.95]``) that is **shared** by the
+candidate and the incumbent on the same instance index. Given that shared
+difficulty, the two systems draw *independent* Bernoulli outcomes. Because a
+hard instance depresses both systems together, the paired difference has lower
+variance than an unpaired one - which is exactly the correlation McNemar pairing
+exploits, so the gate's pairing is *genuinely* variance-reducing here rather
+than a formality.
 
 Crucially, this demo does **not** re-implement the gate. It imports
 ``shinka.core.acceptance.PaceGate`` and drives the *real*
@@ -46,9 +77,10 @@ semantics), reusing the harness pattern from
 ``tests/test_pace_gate_integration.py``.
 
 What this DOES show: the effect of the acceptance-gate decision rule, in
-isolation, on a ground-truth-labelled candidate stream.
-What this does NOT show: full LLM-driven evolution, real task difficulty, or
-that the gate helps on any particular real benchmark. It is a mechanism demo.
+isolation (deconfounded via the third arm), on a ground-truth-labelled candidate
+stream.
+What this does NOT show: full LLM-driven evolution, real task difficulty, or that
+the gate helps on any particular real benchmark. It is a mechanism demo.
 
 Run:  ``uv run python examples/pace_winners_curse/run_demo.py``
 Outputs (written next to this file): ``results.json`` and ``winners_curse.png``.
@@ -59,9 +91,9 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
-from dataclasses import dataclass, field, asdict, replace
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -124,9 +156,10 @@ class DemoConfig:
     regime: str = PLANTED  # "planted" | "null_only"
     n_dev: int = 40  # paired dev instances per comparison
     n_rounds: int = 60  # proposal rounds per run (T)
-    n_seeds: int = 5  # independent replications per arm
+    n_seeds: int = 20  # independent replications per arm
     p_base: float = 0.5  # incumbent's true per-instance success probability
     delta: float = 0.30  # true effect size for planted improvements/regressions
+    sigma_inst: float = 0.15  # per-instance difficulty std (paired heterogeneity)
     n_improvements: int = 3  # planted true improvements (ignored in null_only)
     n_regressions: int = 3  # planted true regressions per run
     alpha: float = 0.05  # anytime-valid significance level (gate)
@@ -161,7 +194,7 @@ def build_stream(cfg: DemoConfig, run_seed: int) -> List[Dict[str, Any]]:
     (ground truth by construction) and a ``kind`` label. Most rounds are nulls
     (``p_true == p_base``); a few planted rounds are true improvements
     (``+delta``) or regressions (``-delta``). Planted round positions are drawn
-    from the run seed so the same stream is replayed identically for both arms.
+    from the run seed so the same stream is replayed identically for all arms.
 
     In the ``null_only`` regime there are **no** improvements (every candidate is
     a true null plus a few true regressions), so ``planted_improvements()``
@@ -188,17 +221,45 @@ def build_stream(cfg: DemoConfig, run_seed: int) -> List[Dict[str, Any]]:
     return stream
 
 
-def eval_vector(p_true: float, n_dev: int, rng: np.random.Generator) -> Dict[str, float]:
-    """One dev evaluation: independent Bernoulli(p_true) over a shared instance set.
+def eval_pair(
+    cand_p: float,
+    inc_p: float,
+    n_dev: int,
+    rng: np.random.Generator,
+    sigma_inst: float,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """One paired dev evaluation of candidate + incumbent on a shared instance set.
 
-    The keys ``inst_00..inst_{n-1}`` are shared across candidate and incumbent
-    (the paired-seed eval model: the *same* instance set is scored for both), but
-    each system draws its own Bernoulli outcome per instance -- exactly the noise
-    that lets a lucky null out-score the incumbent and trigger the winner's curse.
+    Each instance ``i`` draws a *shared* difficulty offset
+    ``e_i ~ Normal(0, sigma_inst)``; the per-instance success probability is
+    ``clip(p_true + e_i, 0.05, 0.95)`` for whichever system, so a hard instance
+    (negative ``e_i``) depresses candidate *and* incumbent together. Given that
+    shared difficulty the two systems draw **independent** Bernoulli outcomes.
+
+    The shared difficulty is what makes the McNemar pairing genuinely
+    variance-reducing: the paired candidate-minus-incumbent difference has lower
+    variance than an unpaired one, so the gate's discordant-pair evidence is
+    cleaner. The independent per-system noise on top is exactly what still lets a
+    lucky null out-score the incumbent and trigger the winner's curse.
+
+    The offsets are drawn first, then the candidate's Bernoulli draws, then the
+    incumbent's, all off a single per-round generator - so the candidate vector
+    is *identical across arms* for a given ``(run_seed, round)`` (it depends only
+    on the offsets and the candidate draws, never on ``inc_p``), keeping the
+    three arms strictly comparable on the same candidate stream.
     """
-    return {
-        f"inst_{i:02d}": float(rng.random() < p_true) for i in range(n_dev)
+    offsets = rng.normal(0.0, sigma_inst, size=n_dev)
+    cand_p_vec = np.clip(cand_p + offsets, 0.05, 0.95)
+    inc_p_vec = np.clip(inc_p + offsets, 0.05, 0.95)
+    cand_draws = rng.random(n_dev)
+    inc_draws = rng.random(n_dev)
+    cand = {
+        f"inst_{i:02d}": float(cand_draws[i] < cand_p_vec[i]) for i in range(n_dev)
     }
+    inc = {
+        f"inst_{i:02d}": float(inc_draws[i] < inc_p_vec[i]) for i in range(n_dev)
+    }
+    return cand, inc
 
 
 # ---------------------------------------------------------------------------
@@ -296,11 +357,29 @@ def _finish(
 
 
 # ---------------------------------------------------------------------------
-# Arm A: stock greedy (accept iff dev score > incumbent dev score).
+# Greedy arms: frozen (``greedy``) and re-evaluated (``greedy_reeval``).
 # ---------------------------------------------------------------------------
 
 
-def run_greedy(cfg: DemoConfig, run_seed: int, stream: List[Dict[str, Any]]) -> RunResult:
+def run_greedy_variant(
+    cfg: DemoConfig,
+    run_seed: int,
+    stream: List[Dict[str, Any]],
+    *,
+    reeval: bool,
+) -> RunResult:
+    """Greedy hill-climb using the "did the dev number go up?" rule.
+
+    ``reeval=False`` (arm ``greedy``): compares the candidate against the
+    incumbent's *frozen stored* dev score (1x eval cost/round). ``reeval=True``
+    (arm ``greedy_reeval``): re-evaluates the incumbent fresh on this round's
+    paired instances - the same 2x eval cost and protocol PACE pays - and
+    compares against that re-evaluated mean. Both use the naive greedy accept
+    rule; only the baseline (frozen vs. re-evaluated) differs, which is exactly
+    the confound the third arm removes.
+    """
+    arm = "greedy_reeval" if reeval else "greedy"
+    prefix = "r" if reeval else "g"
     with tempfile.TemporaryDirectory() as tmpdir:
         db = _make_db(tmpdir)
         try:
@@ -313,18 +392,26 @@ def run_greedy(cfg: DemoConfig, run_seed: int, stream: List[Dict[str, Any]]) -> 
             n_commits = false_commits = captured = dev_evals = 0
             for spec in stream:
                 rng = np.random.default_rng((run_seed, spec["round"]))
-                cand_vec = eval_vector(spec["p_true"], cfg.n_dev, rng)
-                dev_evals += cfg.n_dev  # candidate eval; incumbent uses stored score
-                cand_dev = float(np.mean(list(cand_vec.values())))
-
                 incumbent = db.get_best_program()
-                inc_dev = float(incumbent.combined_score)
                 inc_true = float((incumbent.metadata or {}).get("p_true", cfg.p_base))
+                # Candidate vector is identical across all arms (see eval_pair);
+                # inc_vec is the paired incumbent re-eval, used only when reeval.
+                cand_vec, inc_vec = eval_pair(
+                    spec["p_true"], inc_true, cfg.n_dev, rng, cfg.sigma_inst
+                )
+                cand_dev = float(np.mean(list(cand_vec.values())))
+                if reeval:
+                    inc_dev = float(np.mean(list(inc_vec.values())))
+                    dev_evals += 2 * cfg.n_dev  # candidate + paired incumbent re-eval
+                else:
+                    inc_dev = float(incumbent.combined_score)  # frozen stored score
+                    dev_evals += cfg.n_dev  # candidate only; incumbent score reused
 
                 # The ubiquitous rule: did the dev number go up?
                 if cand_dev > inc_dev:
                     cand = _candidate_program(
-                        f"g{spec['round']}", spec, cand_vec, cand_dev, incumbent.id
+                        f"{prefix}{spec['round']}", spec, cand_vec, cand_dev,
+                        incumbent.id,
                     )
                     db.add(cand)  # gate_passed defaults to 1 -> eligible
                     n_commits += 1
@@ -333,14 +420,14 @@ def run_greedy(cfg: DemoConfig, run_seed: int, stream: List[Dict[str, Any]]) -> 
                     if spec["kind"] == IMPROVEMENT:
                         captured += 1
             return _finish(
-                "greedy", run_seed, db, n_commits, false_commits, captured, cfg, dev_evals
+                arm, run_seed, db, n_commits, false_commits, captured, cfg, dev_evals
             )
         finally:
             db.close()
 
 
 # ---------------------------------------------------------------------------
-# Arm B: PACE-gated (accept iff the REAL PaceGate verdict commits).
+# PACE arm: re-eval + real PaceGate verdict.
 # ---------------------------------------------------------------------------
 
 
@@ -370,15 +457,16 @@ def run_pace(cfg: DemoConfig, run_seed: int, stream: List[Dict[str, Any]]) -> Ru
             n_commits = false_commits = captured = dev_evals = 0
             for spec in stream:
                 rng = np.random.default_rng((run_seed, spec["round"]))
-                cand_vec = eval_vector(spec["p_true"], cfg.n_dev, rng)
-                cand_dev = float(np.mean(list(cand_vec.values())))
-
                 incumbent = db.get_best_program()
                 inc_true = float((incumbent.metadata or {}).get("p_true", cfg.p_base))
-                # Re-evaluate the incumbent on the SAME instance set this round
-                # (paired eval) and hand that fresh vector to the gate as the
-                # comparison baseline. This is the extra eval cost PACE pays.
-                inc_vec = eval_vector(inc_true, cfg.n_dev, rng)
+                # Re-evaluate the incumbent on the SAME paired instance set this
+                # round (shared difficulty offsets) and hand that fresh vector to
+                # the gate as the comparison baseline -- the extra eval cost PACE
+                # pays, identical to greedy_reeval's.
+                cand_vec, inc_vec = eval_pair(
+                    spec["p_true"], inc_true, cfg.n_dev, rng, cfg.sigma_inst
+                )
+                cand_dev = float(np.mean(list(cand_vec.values())))
                 incumbent.private_metrics = {PACE_INSTANCE_KEY: dict(inc_vec)}
                 dev_evals += 2 * cfg.n_dev  # candidate + paired incumbent re-eval
 
@@ -401,7 +489,9 @@ def run_pace(cfg: DemoConfig, run_seed: int, stream: List[Dict[str, Any]]) -> Ru
                 "pace", run_seed, db, n_commits, false_commits, captured, cfg, dev_evals
             )
         finally:
-            async_db.close() if hasattr(async_db, "close") else None
+            # Real executor shutdown: AsyncProgramDatabase exposes close_async()
+            # (there is no sync close()); await it so the thread pools are joined.
+            asyncio.run(async_db.close_async())
             db.close()
 
 
@@ -410,14 +500,25 @@ def run_pace(cfg: DemoConfig, run_seed: int, stream: List[Dict[str, Any]]) -> Ru
 # ---------------------------------------------------------------------------
 
 
+ARMS = ["greedy", "greedy_reeval", "pace"]
+
+
+def _run_arm(arm: str, cfg: DemoConfig, run_seed: int, stream) -> RunResult:
+    if arm == "greedy":
+        return run_greedy_variant(cfg, run_seed, stream, reeval=False)
+    if arm == "greedy_reeval":
+        return run_greedy_variant(cfg, run_seed, stream, reeval=True)
+    return run_pace(cfg, run_seed, stream)
+
+
 def run_regime(cfg: DemoConfig) -> Dict[str, Any]:
-    """Run both arms across all seeds for ONE regime; return a results dict."""
+    """Run all three arms across all seeds for ONE regime; return a results dict."""
     runs: List[RunResult] = []
     for r in range(cfg.n_seeds):
         run_seed = cfg.seed0 + r
-        stream = build_stream(cfg, run_seed)  # identical stream for both arms
-        runs.append(run_greedy(cfg, run_seed, stream))
-        runs.append(run_pace(cfg, run_seed, stream))
+        stream = build_stream(cfg, run_seed)  # identical stream for all arms
+        for arm in ARMS:
+            runs.append(_run_arm(arm, cfg, run_seed, stream))
     return {
         "config": asdict(cfg),
         "runs": [rr.as_dict() for rr in runs],
@@ -444,19 +545,34 @@ def run_experiment(base_cfg: DemoConfig) -> Dict[str, Any]:
 
 def _summarise(runs: List[RunResult]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    for arm in ("greedy", "pace"):
+    for arm in ARMS:
         arm_runs = [r for r in runs if r.arm == arm]
 
         def mean(attr: str) -> float:
             return float(np.mean([getattr(r, attr) for r in arm_runs]))
 
+        def std(attr: str) -> float:
+            return float(np.std([getattr(r, attr) for r in arm_runs]))
+
+        total_commits = int(sum(r.n_commits for r in arm_runs))
+        total_false = int(sum(r.false_commits for r in arm_runs))
         out[arm] = {
             "reported_best_dev_mean": mean("reported_best_dev"),
+            "reported_best_dev_std": std("reported_best_dev"),
             "reported_best_true_mean": mean("reported_best_true"),
             "winners_curse_gap_mean": mean("winners_curse_gap"),
+            "winners_curse_gap_std": std("winners_curse_gap"),
             "n_commits_mean": mean("n_commits"),
+            "n_commits_std": std("n_commits"),
             "false_commits_mean": mean("false_commits"),
+            "false_commits_std": std("false_commits"),
+            # Per-run rate averaged over seeds (kept for reference); the honest
+            # cross-seed rate is the POOLED one below (total false / total
+            # commits), which is not distorted by zero-commit seeds.
             "false_commit_rate_mean": mean("false_commit_rate"),
+            "false_commits_total": total_false,
+            "n_commits_total": total_commits,
+            "false_commit_rate_pooled": total_false / max(total_commits, 1),
             # Fraction of runs whose shipped best actually reached the optimum.
             "reached_optimum_rate": mean("reached_optimum"),
             "dev_evals_mean": mean("dev_evals"),
@@ -464,9 +580,23 @@ def _summarise(runs: List[RunResult]) -> Dict[str, Any]:
     return out
 
 
-_ARMS = ["greedy", "pace"]
-_ARM_LABELS = {"greedy": "Arm A\nstock greedy", "pace": "Arm B\nPACE-gated"}
-_ARM_COLORS = {"greedy": "#d1495b", "pace": "#2e86ab"}
+# ---------------------------------------------------------------------------
+# Chart.
+# ---------------------------------------------------------------------------
+
+
+_ARM_LABELS = {
+    "greedy": "greedy\n(frozen)",
+    "greedy_reeval": "greedy_reeval\n(re-eval, no gate)",
+    "pace": "PACE\n(re-eval + gate)",
+}
+_ARM_LEGEND = {
+    "greedy": "greedy (frozen)",
+    "greedy_reeval": "greedy_reeval (re-eval, no gate)",
+    "pace": "PACE (re-eval + gate)",
+}
+_ARM_COLORS = {"greedy": "#d1495b", "greedy_reeval": "#edae49", "pace": "#2e86ab"}
+_TRUE_COLOR = "#8d99ae"
 _REGIME_TITLES = {
     PLANTED: "Regime: planted (a few genuine improvements exist)",
     NULL_ONLY: "Regime: null_only (no genuine improvement anywhere)",
@@ -477,20 +607,33 @@ def _series(runs: List[Dict[str, Any]], arm: str, attr: str) -> np.ndarray:
     return np.array([r[attr] for r in runs if r["arm"] == arm], dtype=float)
 
 
+def _pooled_rate(runs: List[Dict[str, Any]], arm: str) -> float:
+    """Pooled false-commit rate: total false commits / total commits over seeds.
+
+    Unlike the mean of per-run rates, this is undistorted by zero-commit seeds
+    (whose per-run rate is defined as 0), so it is the honest cross-seed rate.
+    """
+    total_commits = float(_series(runs, arm, "n_commits").sum())
+    total_false = float(_series(runs, arm, "false_commits").sum())
+    return total_false / max(total_commits, 1.0)
+
+
 def _panel_reported_vs_true(ax, runs: List[Dict[str, Any]], title: str) -> None:
     """Reported best dev vs. its true quality, per arm (the inflation panel)."""
-    x = np.arange(len(_ARMS))
-    width = 0.36
-    rep_mean = [_series(runs, a, "reported_best_dev").mean() for a in _ARMS]
-    rep_err = [_series(runs, a, "reported_best_dev").std() for a in _ARMS]
-    true_mean = [_series(runs, a, "reported_best_true").mean() for a in _ARMS]
-    true_err = [_series(runs, a, "reported_best_true").std() for a in _ARMS]
+    from matplotlib.patches import Patch
+
+    x = np.arange(len(ARMS))
+    width = 0.38
+    rep_mean = [_series(runs, a, "reported_best_dev").mean() for a in ARMS]
+    rep_err = [_series(runs, a, "reported_best_dev").std() for a in ARMS]
+    true_mean = [_series(runs, a, "reported_best_true").mean() for a in ARMS]
+    true_err = [_series(runs, a, "reported_best_true").std() for a in ARMS]
 
     ax.bar(x - width / 2, rep_mean, width, yerr=rep_err, capsize=4,
-           color=[_ARM_COLORS[a] for a in _ARMS], label="reported best dev score")
+           color=[_ARM_COLORS[a] for a in ARMS])
     ax.bar(x + width / 2, true_mean, width, yerr=true_err, capsize=4,
-           color="#bcbcbc", label="TRUE quality (audit)")
-    for i, a in enumerate(_ARMS):
+           color=_TRUE_COLOR)
+    for i, a in enumerate(ARMS):
         gap = rep_mean[i] - true_mean[i]
         ax.annotate(
             f"gap {gap:+.3f}",
@@ -499,35 +642,46 @@ def _panel_reported_vs_true(ax, runs: List[Dict[str, Any]], title: str) -> None:
             color=_ARM_COLORS[a],
         )
     ax.set_xticks(x)
-    ax.set_xticklabels([_ARM_LABELS[a] for a in _ARMS])
+    ax.set_xticklabels([_ARM_LABELS[a] for a in ARMS], fontsize=8)
     ax.set_ylabel("per-instance success rate")
-    ax.set_ylim(0, 1.18)
+    ax.set_ylim(0, 1.25)
     ax.set_title(title, fontsize=10)
-    ax.legend(fontsize=8, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.0))
+    # Explicit, correctly-coloured swatches: one per arm (the reported bars) plus
+    # the shared grey "true quality" bar. (A single ``color=[list]`` bar call
+    # would legend as one wrong-coloured swatch, so we build handles by hand.)
+    handles = [Patch(color=_ARM_COLORS[a], label=f"reported best: {_ARM_LEGEND[a]}")
+               for a in ARMS]
+    handles.append(Patch(color=_TRUE_COLOR, label="TRUE quality (audit)"))
+    ax.legend(handles=handles, fontsize=7, loc="upper center", ncol=2,
+              bbox_to_anchor=(0.5, 1.0))
     ax.grid(axis="y", alpha=0.3)
 
 
 def _panel_false_commits(ax, runs: List[Dict[str, Any]], title: str) -> None:
     """False commits per run, per arm (audit-labelled churn)."""
-    x = np.arange(len(_ARMS))
-    fc_mean = [_series(runs, a, "false_commits").mean() for a in _ARMS]
-    fc_err = [_series(runs, a, "false_commits").std() for a in _ARMS]
-    ax.bar(x, fc_mean, 0.5, yerr=fc_err, capsize=4,
-           color=[_ARM_COLORS[a] for a in _ARMS])
+    from matplotlib.patches import Patch
+
+    x = np.arange(len(ARMS))
+    fc_mean = [_series(runs, a, "false_commits").mean() for a in ARMS]
+    fc_err = [_series(runs, a, "false_commits").std() for a in ARMS]
+    ax.bar(x, fc_mean, 0.6, yerr=fc_err, capsize=4,
+           color=[_ARM_COLORS[a] for a in ARMS])
     top = max(fc_mean) if max(fc_mean) > 0 else 1.0
-    for i, a in enumerate(_ARMS):
-        rate = _series(runs, a, "false_commit_rate").mean()
+    for i, a in enumerate(ARMS):
+        pooled = _pooled_rate(runs, a)
         ax.annotate(
-            f"{fc_mean[i]:.1f}  ({rate:.0%} of commits)",
+            f"{fc_mean[i]:.1f}/run\n(pooled {pooled:.0%})",
             (x[i], fc_mean[i] + fc_err[i] + top * 0.04 + 0.03),
-            ha="center", va="bottom", fontsize=9, fontweight="bold",
+            ha="center", va="bottom", fontsize=8, fontweight="bold",
             color=_ARM_COLORS[a],
         )
     ax.set_xticks(x)
-    ax.set_xticklabels([_ARM_LABELS[a] for a in _ARMS])
+    ax.set_xticklabels([_ARM_LABELS[a] for a in ARMS], fontsize=8)
     ax.set_ylabel("false commits per run (mean)")
-    ax.set_ylim(0, top + top * 0.25 + 1)
+    ax.set_ylim(0, top + top * 0.35 + 1)
     ax.set_title(title, fontsize=10)
+    handles = [Patch(color=_ARM_COLORS[a], label=_ARM_LEGEND[a]) for a in ARMS]
+    ax.legend(handles=handles, fontsize=7, loc="upper right")
     ax.grid(axis="y", alpha=0.3)
 
 
@@ -538,10 +692,10 @@ def make_chart(results: Dict[str, Any], out_path: Path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9.4))
+    fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.6))
     fig.suptitle(
-        "PACE acceptance gate vs. stock greedy: the winner's curse across two "
-        "regimes\n(synthetic, ground-truth by construction; "
+        "PACE acceptance gate vs. greedy: the winner's curse, deconfounded "
+        "(3 arms) across two regimes\n(synthetic, ground-truth by construction; "
         "arXiv 2606.08106 §5.1/§5.2)",
         fontsize=12, fontweight="bold",
     )
@@ -577,21 +731,24 @@ def main() -> None:
     cfg = DemoConfig()
     out_dir = Path(__file__).resolve().parent
     results = run_demo(cfg, out_dir)
-    print("PACE winner's-curse demo complete (two regimes).")
+    print("PACE winner's-curse demo complete (three arms, two regimes).")
     print(f"  config: T={cfg.n_rounds} rounds, n_dev={cfg.n_dev}, "
-          f"{cfg.n_seeds} seeds/arm, delta={cfg.delta}, alpha={cfg.alpha}")
+          f"{cfg.n_seeds} seeds/arm, delta={cfg.delta}, "
+          f"sigma_inst={cfg.sigma_inst}, alpha={cfg.alpha}")
     for regime in REGIMES:
         s = results[regime]["summary"]
         print(f"  == regime: {regime} ==")
-        for arm in ("greedy", "pace"):
+        for arm in ARMS:
             a = s[arm]
             print(
-                f"    [{arm:>6}] reported={a['reported_best_dev_mean']:.3f} "
+                f"    [{arm:>13}] reported={a['reported_best_dev_mean']:.3f}"
+                f"±{a['reported_best_dev_std']:.3f} "
                 f"true={a['reported_best_true_mean']:.3f} "
                 f"gap={a['winners_curse_gap_mean']:+.3f} | "
                 f"commits={a['n_commits_mean']:.1f} "
-                f"false={a['false_commits_mean']:.1f} "
-                f"({a['false_commit_rate_mean']:.0%}) | "
+                f"false={a['false_commits_mean']:.1f}"
+                f"±{a['false_commits_std']:.1f} "
+                f"(pooled {a['false_commit_rate_pooled']:.0%}) | "
                 f"reached_opt={a['reached_optimum_rate']:.0%} | "
                 f"dev_evals={a['dev_evals_mean']:.0f}"
             )
