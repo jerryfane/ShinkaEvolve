@@ -73,7 +73,7 @@ class ArchiveInspirationSelector(ContextSelectorStrategy):
                 """
                 SELECT p.id FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.island_idx = ? AND p.correct = 1
+                WHERE p.island_idx = ? AND p.correct = 1 AND p.gate_passed = 1
                 ORDER BY p.combined_score DESC
                 LIMIT ?
                 """,
@@ -95,7 +95,7 @@ class ArchiveInspirationSelector(ContextSelectorStrategy):
                 sql_rand = f"""
                     SELECT p.id FROM programs p
                     JOIN archive a ON p.id = a.program_id
-                    WHERE p.island_idx = ? AND p.correct = 1
+                    WHERE p.island_idx = ? AND p.correct = 1 AND p.gate_passed = 1
                     AND p.id NOT IN ({placeholders_rand})
                     ORDER BY RANDOM() LIMIT ?
                 """
@@ -115,7 +115,7 @@ class ArchiveInspirationSelector(ContextSelectorStrategy):
                 placeholders_rand = ",".join("?" * len(insp_ids))
                 sql_rand = f"""SELECT p.id FROM programs p
                                  JOIN archive a ON p.id = a.program_id
-                                 WHERE p.correct = 1
+                                 WHERE p.correct = 1 AND p.gate_passed = 1
                                  AND p.id NOT IN ({placeholders_rand})
                                  ORDER BY RANDOM() LIMIT ?
                                  """
@@ -180,7 +180,7 @@ class TopKInspirationSelector(ContextSelectorStrategy):
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
                 WHERE p.island_idx = ? AND p.id NOT IN ({placeholders}) 
-                AND p.correct = 1
+                AND p.correct = 1 AND p.gate_passed = 1
             """
             params = [parent_island_idx] + list(excluded_ids)
             search_scope = f"island {parent_island_idx}"
@@ -191,7 +191,7 @@ class TopKInspirationSelector(ContextSelectorStrategy):
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
                 WHERE p.id NOT IN ({placeholders}) 
-                AND p.correct = 1
+                AND p.correct = 1 AND p.gate_passed = 1
             """
             params = list(excluded_ids)
             search_scope = "all islands"

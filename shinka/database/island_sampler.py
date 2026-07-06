@@ -51,7 +51,7 @@ class IslandSampler(ABC):
         query = f"""
             SELECT island_idx, COUNT(*) as count
             FROM programs
-            WHERE island_idx IN ({placeholders}) AND correct = 1
+            WHERE island_idx IN ({placeholders}) AND correct = 1 AND gate_passed = 1
             GROUP BY island_idx
         """
         self.cursor.execute(query, island_indices)
@@ -78,7 +78,7 @@ class IslandSampler(ABC):
         query = f"""
             SELECT island_idx, MAX(combined_score) as best_fitness
             FROM programs
-            WHERE island_idx IN ({placeholders}) AND correct = 1
+            WHERE island_idx IN ({placeholders}) AND correct = 1 AND gate_passed = 1
             GROUP BY island_idx
         """
         self.cursor.execute(query, island_indices)

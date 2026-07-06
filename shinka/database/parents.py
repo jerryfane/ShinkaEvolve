@@ -111,11 +111,15 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
             self.cursor.execute(
                 """SELECT a.program_id FROM archive a
                    JOIN programs p ON a.program_id = p.id
-                   WHERE p.island_idx = ?""",
+                   WHERE p.island_idx = ? AND p.gate_passed = 1""",
                 (self.island_idx,),
             )
         else:
-            self.cursor.execute("SELECT program_id FROM archive")
+            self.cursor.execute(
+                """SELECT a.program_id FROM archive a
+                   JOIN programs p ON a.program_id = p.id
+                   WHERE p.gate_passed = 1"""
+            )
 
         archived_rows = self.cursor.fetchall()
 
@@ -161,14 +165,14 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
         if self.island_idx is not None:
             self.cursor.execute(
                 """SELECT p.id FROM programs p
-                   WHERE p.correct = 1 AND p.island_idx = ?
+                   WHERE p.correct = 1 AND p.gate_passed = 1 AND p.island_idx = ?
                    ORDER BY p.combined_score DESC""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
                 """SELECT p.id FROM programs p
-                   WHERE p.correct = 1
+                   WHERE p.correct = 1 AND p.gate_passed = 1
                    ORDER BY p.combined_score DESC"""
             )
 
@@ -209,13 +213,13 @@ class PowerLawSamplingStrategy(ParentSamplingStrategy):
         if self.island_idx is not None:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE correct = 1 AND island_idx = ?
+                   WHERE correct = 1 AND gate_passed = 1 AND island_idx = ?
                    ORDER BY RANDOM() LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
-                """SELECT id FROM programs WHERE correct = 1
+                """SELECT id FROM programs WHERE correct = 1 AND gate_passed = 1
                    ORDER BY RANDOM() LIMIT 1"""
             )
         row = self.cursor.fetchone()
@@ -245,7 +249,7 @@ class WeightedSamplingStrategy(ParentSamplingStrategy):
                 SELECT p.*
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.correct = 1 AND p.island_idx = ?
+                WHERE p.correct = 1 AND p.gate_passed = 1 AND p.island_idx = ?
                 """,
                 (self.island_idx,),
             )
@@ -255,7 +259,7 @@ class WeightedSamplingStrategy(ParentSamplingStrategy):
                 SELECT p.*
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.correct = 1
+                WHERE p.correct = 1 AND p.gate_passed = 1
                 """
             )
         archive_rows = self.cursor.fetchall()
@@ -279,13 +283,13 @@ class WeightedSamplingStrategy(ParentSamplingStrategy):
             if self.island_idx is not None:
                 self.cursor.execute(
                     """SELECT id FROM programs
-                       WHERE correct = 1 AND island_idx = ?
+                       WHERE correct = 1 AND gate_passed = 1 AND island_idx = ?
                        ORDER BY RANDOM() LIMIT 1""",
                     (self.island_idx,),
                 )
             else:
                 self.cursor.execute(
-                    """SELECT id FROM programs WHERE correct = 1
+                    """SELECT id FROM programs WHERE correct = 1 AND gate_passed = 1
                        ORDER BY RANDOM() LIMIT 1"""
                 )
             row = self.cursor.fetchone()
@@ -525,7 +529,7 @@ class BeamSearchSamplingStrategy(ParentSamplingStrategy):
 
         # Final fallback
         self.cursor.execute(
-            "SELECT id FROM programs WHERE correct = 1 ORDER BY RANDOM() LIMIT 1"
+            "SELECT id FROM programs WHERE correct = 1 AND gate_passed = 1 ORDER BY RANDOM() LIMIT 1"
         )
         row = self.cursor.fetchone()
         return self.get_program(row["id"]) if row else None
@@ -539,14 +543,14 @@ class BestOfNSamplingStrategy(ParentSamplingStrategy):
         if self.island_idx is not None:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE generation = 0 AND island_idx = ? AND correct = 1
+                   WHERE generation = 0 AND island_idx = ? AND correct = 1 AND gate_passed = 1
                    ORDER BY id LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE generation = 0 AND correct = 1
+                   WHERE generation = 0 AND correct = 1 AND gate_passed = 1
                    ORDER BY id LIMIT 1"""
             )
 
@@ -570,14 +574,14 @@ class BestOfNSamplingStrategy(ParentSamplingStrategy):
         if self.island_idx is not None:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE correct = 1 AND island_idx = ?
+                   WHERE correct = 1 AND gate_passed = 1 AND island_idx = ?
                    ORDER BY generation ASC, id ASC LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE correct = 1
+                   WHERE correct = 1 AND gate_passed = 1
                    ORDER BY generation ASC, id ASC LIMIT 1"""
             )
 
@@ -607,14 +611,14 @@ class SequentialSamplingStrategy(ParentSamplingStrategy):
         if self.island_idx is not None:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE correct = 1 AND island_idx = ?
+                   WHERE correct = 1 AND gate_passed = 1 AND island_idx = ?
                    ORDER BY generation DESC, id DESC LIMIT 1""",
                 (self.island_idx,),
             )
         else:
             self.cursor.execute(
                 """SELECT id FROM programs
-                   WHERE correct = 1
+                   WHERE correct = 1 AND gate_passed = 1
                    ORDER BY generation DESC, id DESC LIMIT 1"""
             )
 
@@ -695,11 +699,11 @@ class CombinedParentSelector:
         """Check if there are any correct programs in the database."""
         if island_idx is not None:
             self.cursor.execute(
-                "SELECT COUNT(*) FROM programs WHERE correct = 1 AND island_idx = ?",
+                "SELECT COUNT(*) FROM programs WHERE correct = 1 AND gate_passed = 1 AND island_idx = ?",
                 (island_idx,),
             )
         else:
-            self.cursor.execute("SELECT COUNT(*) FROM programs WHERE correct = 1")
+            self.cursor.execute("SELECT COUNT(*) FROM programs WHERE correct = 1 AND gate_passed = 1")
         count = self.cursor.fetchone()[0]
         return count > 0
 
@@ -844,7 +848,7 @@ class CombinedParentSelector:
             if island_idx is not None:
                 self.cursor.execute(
                     """SELECT id FROM programs 
-                       WHERE correct = 1 AND island_idx = ?
+                       WHERE correct = 1 AND gate_passed = 1 AND island_idx = ?
                        ORDER BY RANDOM() LIMIT 1""",
                     (island_idx,),
                 )

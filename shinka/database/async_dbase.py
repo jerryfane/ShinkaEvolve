@@ -716,6 +716,34 @@ class AsyncProgramDatabase:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.write_executor, update_metadata_sync)
 
+    async def set_gate_passed_async(self, program_id: str, passed: bool) -> None:
+        """Persist a PACE acceptance-gate verdict on the dedicated writer lane.
+
+        Args:
+            program_id: ID of the program whose verdict is being recorded.
+            passed: True when the candidate is accepted (eligible for
+                selection/side-effects), False when the gate rejects it.
+        """
+
+        def set_gate_passed_sync():
+            thread_db = None
+            try:
+                thread_db = ProgramDatabase(
+                    self.sync_db.config,
+                    embedding_model=self.sync_db.embedding_model,
+                )
+                thread_db.cursor.execute(
+                    "UPDATE programs SET gate_passed = ? WHERE id = ?",
+                    (1 if passed else 0, program_id),
+                )
+                thread_db.conn.commit()
+            finally:
+                if thread_db is not None:
+                    thread_db.close()
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self.write_executor, set_gate_passed_sync)
+
     def _schedule_embedding_recomputation(self):
         """Schedule embedding recomputation as a background task."""
         # Cancel any existing recomputation task

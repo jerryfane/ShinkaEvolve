@@ -302,6 +302,7 @@ class ElitistMigrationStrategy(IslandMigrationStrategy):
         selection_query = """
             SELECT id FROM programs
             WHERE island_idx = ? AND generation > 0 AND correct = 1
+              AND gate_passed = 1
         """
 
         if island_elitism:
@@ -311,6 +312,7 @@ class ElitistMigrationStrategy(IslandMigrationStrategy):
             elite_query = """
                 SELECT id FROM programs
                 WHERE island_idx = ? AND generation > 0 AND correct = 1
+                  AND gate_passed = 1
                 ORDER BY combined_score DESC
                 LIMIT 1
             """
@@ -336,7 +338,7 @@ class ElitistMigrationStrategy(IslandMigrationStrategy):
         # First check how many correct non-generation-0 programs are available
         self.cursor.execute(
             "SELECT COUNT(*) FROM programs WHERE island_idx = ? AND "
-            "generation > 0 AND correct = 1",
+            "generation > 0 AND correct = 1 AND gate_passed = 1",
             (source_idx,),
         )
         available_programs = (self.cursor.fetchone() or [0])[0]
@@ -727,7 +729,7 @@ class CombinedIslandManager:
         """
         self.cursor.execute(
             """SELECT * FROM programs
-               WHERE correct = 1
+               WHERE correct = 1 AND gate_passed = 1
                ORDER BY combined_score DESC LIMIT 1"""
         )
         row = self.cursor.fetchone()
@@ -898,7 +900,7 @@ class CombinedIslandManager:
         """
         query = """
             SELECT * FROM programs
-            WHERE parent_id = ? AND correct = 1
+            WHERE parent_id = ? AND correct = 1 AND gate_passed = 1
             ORDER BY combined_score DESC
         """
         if limit:
