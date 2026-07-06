@@ -12,6 +12,8 @@ import rich  # type: ignore
 from rich.console import Console as RichConsole  # type: ignore
 from rich.table import Table as RichTable  # type: ignore
 
+from .eligibility import eligible_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,8 +39,8 @@ class IslandStrategy(ABC):
         """Get list of islands that have correct programs.
         Default implementation for base class."""
         self.cursor.execute(
-            """SELECT DISTINCT island_idx FROM programs
-                WHERE correct = 1 AND island_idx IS NOT NULL"""
+            f"""SELECT DISTINCT island_idx FROM programs
+                WHERE {eligible_sql()} AND island_idx IS NOT NULL"""
         )
         islands_with_correct = {
             row["island_idx"]
@@ -53,8 +55,8 @@ class DefaultIslandAssignmentStrategy(IslandStrategy):
 
     def get_initialized_islands(self) -> List[int]:
         self.cursor.execute(
-            """SELECT DISTINCT island_idx FROM programs
-                WHERE correct = 1 AND island_idx IS NOT NULL"""
+            f"""SELECT DISTINCT island_idx FROM programs
+                WHERE {eligible_sql()} AND island_idx IS NOT NULL"""
         )
         islands_with_correct = {
             row["island_idx"]
@@ -115,8 +117,8 @@ class CopyInitialProgramIslandStrategy(IslandStrategy):
 
     def get_initialized_islands(self) -> List[int]:
         self.cursor.execute(
-            """SELECT DISTINCT island_idx FROM programs
-                WHERE correct = 1 AND island_idx IS NOT NULL"""
+            f"""SELECT DISTINCT island_idx FROM programs
+                WHERE {eligible_sql()} AND island_idx IS NOT NULL"""
         )
         islands_with_correct = {
             row["island_idx"]
@@ -299,20 +301,18 @@ class ElitistMigrationStrategy(IslandMigrationStrategy):
         """
         # Base query excludes generation 0 programs and only includes
         # correct programs
-        selection_query = """
+        selection_query = f"""
             SELECT id FROM programs
-            WHERE island_idx = ? AND generation > 0 AND correct = 1
-              AND gate_passed = 1
+            WHERE island_idx = ? AND generation > 0 AND {eligible_sql()}
         """
 
         if island_elitism:
             # Get IDs of best program to protect from migration
             # Also exclude generation 0 programs from elite selection and
             # only consider correct programs
-            elite_query = """
+            elite_query = f"""
                 SELECT id FROM programs
-                WHERE island_idx = ? AND generation > 0 AND correct = 1
-                  AND gate_passed = 1
+                WHERE island_idx = ? AND generation > 0 AND {eligible_sql()}
                 ORDER BY combined_score DESC
                 LIMIT 1
             """
@@ -338,7 +338,7 @@ class ElitistMigrationStrategy(IslandMigrationStrategy):
         # First check how many correct non-generation-0 programs are available
         self.cursor.execute(
             "SELECT COUNT(*) FROM programs WHERE island_idx = ? AND "
-            "generation > 0 AND correct = 1 AND gate_passed = 1",
+            f"generation > 0 AND {eligible_sql()}",
             (source_idx,),
         )
         available_programs = (self.cursor.fetchone() or [0])[0]
@@ -648,10 +648,10 @@ class CombinedIslandManager:
                     top_k_inspiration_ids, generation, timestamp, code_diff,
                     combined_score, public_metrics, private_metrics,
                     text_feedback, complexity, embedding, embedding_pca_2d,
-                    embedding_pca_3d, embedding_cluster_id, correct,
+                    embedding_pca_3d, embedding_cluster_id, correct, gate_passed,
                     children_count, metadata, island_idx, migration_history)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?)
+                           ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_id,
@@ -673,6 +673,7 @@ class CombinedIslandManager:
                     embedding_pca_3d_json,
                     program.embedding_cluster_id,
                     program.correct,
+                    program.gate_passed,
                     program.children_count,
                     metadata_json,
                     island_idx,
@@ -728,8 +729,8 @@ class CombinedIslandManager:
             Dictionary with program data or None if not found
         """
         self.cursor.execute(
-            """SELECT * FROM programs
-               WHERE correct = 1 AND gate_passed = 1
+            f"""SELECT * FROM programs
+               WHERE {eligible_sql()}
                ORDER BY combined_score DESC LIMIT 1"""
         )
         row = self.cursor.fetchone()
@@ -742,8 +743,9 @@ class CombinedIslandManager:
             Dictionary with program data or None if archive is empty
         """
         self.cursor.execute(
-            """SELECT p.* FROM programs p
+            f"""SELECT p.* FROM programs p
                INNER JOIN archive a ON p.id = a.program_id
+               WHERE {eligible_sql("p")}
                ORDER BY RANDOM() LIMIT 1"""
         )
         row = self.cursor.fetchone()
@@ -838,10 +840,10 @@ class CombinedIslandManager:
                 top_k_inspiration_ids, generation, timestamp, code_diff,
                 combined_score, public_metrics, private_metrics,
                 text_feedback, complexity, embedding, embedding_pca_2d,
-                embedding_pca_3d, embedding_cluster_id, correct,
+                embedding_pca_3d, embedding_cluster_id, correct, gate_passed,
                 children_count, metadata, island_idx, migration_history)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?)
+                       ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id,
@@ -863,6 +865,7 @@ class CombinedIslandManager:
                 embedding_pca_3d_json,
                 source_program.get("embedding_cluster_id"),
                 source_program.get("correct", 0),
+                source_program.get("gate_passed", 1),
                 0,  # Children count will be updated as children are added
                 metadata_json,
                 new_island_idx,
@@ -898,9 +901,9 @@ class CombinedIslandManager:
         Returns:
             List of child program dicts
         """
-        query = """
+        query = f"""
             SELECT * FROM programs
-            WHERE parent_id = ? AND correct = 1 AND gate_passed = 1
+            WHERE parent_id = ? AND {eligible_sql()}
             ORDER BY combined_score DESC
         """
         if limit:

@@ -9,6 +9,7 @@ import numpy as np
 from typing import Any, Dict, List, Optional, Tuple, Union
 import math
 from .complexity import analyze_code_metrics
+from .eligibility import eligible_sql
 from .parents import CombinedParentSelector
 from .inspirations import CombinedContextSelector
 from .islands import CombinedIslandManager
@@ -1393,7 +1394,7 @@ class ProgramDatabase:
             # Check if there are any correct programs at all
             self.cursor.execute(
                 "SELECT COUNT(*) as cnt FROM programs "
-                "WHERE correct = 1 AND gate_passed = 1"
+                f"WHERE {eligible_sql()}"
             )
             correct_count = self.cursor.fetchone()["cnt"]
 
@@ -1636,7 +1637,7 @@ class ProgramDatabase:
 
         # Fetch only correct, gate-eligible programs and sort in Python.
         self.cursor.execute(
-            "SELECT * FROM programs WHERE correct = 1 AND gate_passed = 1"
+            f"SELECT * FROM programs WHERE {eligible_sql()}"
         )
         all_rows = self.cursor.fetchall()
         if not all_rows:
@@ -1851,9 +1852,7 @@ class ProgramDatabase:
         # to correct programs we also require gate_passed = 1 so gate-rejected
         # candidates are never surfaced as top-k/selection material (behaviour-
         # neutral when the gate is off, since gate_passed defaults to 1).
-        correctness_filter = (
-            "WHERE correct = 1 AND gate_passed = 1" if correct_only else ""
-        )
+        correctness_filter = f"WHERE {eligible_sql()}" if correct_only else ""
 
         # Try to use SQL for sorting when possible for better performance
         if metric == "combined_score":
@@ -1863,7 +1862,7 @@ class ProgramDatabase:
                 WHERE combined_score IS NOT NULL
             """
             if correct_only:
-                base_query += " AND correct = 1 AND gate_passed = 1"
+                base_query += f" AND {eligible_sql()}"
             base_query += " ORDER BY combined_score DESC LIMIT ?"
 
             self.cursor.execute(base_query, (n,))
@@ -3078,7 +3077,7 @@ class ProgramDatabase:
                 WHERE combined_score IS NOT NULL
             """
             if correct_only:
-                base_query += " AND correct = 1 AND gate_passed = 1"
+                base_query += f" AND {eligible_sql()}"
             base_query += " ORDER BY combined_score DESC LIMIT ?"
 
             cursor.execute(base_query, (n,))

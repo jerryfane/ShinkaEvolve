@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .complexity import analyze_code_metrics
 from .dbase import Program, ProgramDatabase
+from .eligibility import eligible_sql
 
 logger = logging.getLogger(__name__)
 
@@ -1307,7 +1308,7 @@ class AsyncProgramDatabase:
                     if correct_only:
                         thread_db.cursor.execute(
                             "SELECT combined_score FROM programs "
-                            "WHERE correct = 1 AND combined_score IS NOT NULL"
+                            f"WHERE {eligible_sql()} AND combined_score IS NOT NULL"
                         )
                     else:
                         thread_db.cursor.execute(

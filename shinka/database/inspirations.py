@@ -3,6 +3,8 @@ import sqlite3
 from abc import ABC, abstractmethod
 from typing import Optional, Callable, Any, List, Set, Literal
 
+from .eligibility import eligible_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,10 +72,10 @@ class ArchiveInspirationSelector(ContextSelectorStrategy):
         num_elites = max(0, int(n * self.config.elite_selection_ratio))
         if num_elites > 0 and len(inspirations) < n and parent_island_idx is not None:
             self.cursor.execute(
-                """
+                f"""
                 SELECT p.id FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.island_idx = ? AND p.correct = 1 AND p.gate_passed = 1
+                WHERE p.island_idx = ? AND {eligible_sql("p")}
                 ORDER BY p.combined_score DESC
                 LIMIT ?
                 """,
@@ -95,7 +97,7 @@ class ArchiveInspirationSelector(ContextSelectorStrategy):
                 sql_rand = f"""
                     SELECT p.id FROM programs p
                     JOIN archive a ON p.id = a.program_id
-                    WHERE p.island_idx = ? AND p.correct = 1 AND p.gate_passed = 1
+                    WHERE p.island_idx = ? AND {eligible_sql("p")}
                     AND p.id NOT IN ({placeholders_rand})
                     ORDER BY RANDOM() LIMIT ?
                 """
@@ -115,7 +117,7 @@ class ArchiveInspirationSelector(ContextSelectorStrategy):
                 placeholders_rand = ",".join("?" * len(insp_ids))
                 sql_rand = f"""SELECT p.id FROM programs p
                                  JOIN archive a ON p.id = a.program_id
-                                 WHERE p.correct = 1 AND p.gate_passed = 1
+                                 WHERE {eligible_sql("p")}
                                  AND p.id NOT IN ({placeholders_rand})
                                  ORDER BY RANDOM() LIMIT ?
                                  """
@@ -179,8 +181,8 @@ class TopKInspirationSelector(ContextSelectorStrategy):
                 SELECT p.*
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.island_idx = ? AND p.id NOT IN ({placeholders}) 
-                AND p.correct = 1 AND p.gate_passed = 1
+                WHERE p.island_idx = ? AND p.id NOT IN ({placeholders})
+                AND {eligible_sql("p")}
             """
             params = [parent_island_idx] + list(excluded_ids)
             search_scope = f"island {parent_island_idx}"
@@ -190,8 +192,8 @@ class TopKInspirationSelector(ContextSelectorStrategy):
                 SELECT p.*
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.id NOT IN ({placeholders}) 
-                AND p.correct = 1 AND p.gate_passed = 1
+                WHERE p.id NOT IN ({placeholders})
+                AND {eligible_sql("p")}
             """
             params = list(excluded_ids)
             search_scope = "all islands"
